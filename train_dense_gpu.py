@@ -60,60 +60,86 @@ def set_cuda_env():
         pass
 
 # -------------------------
-# Tiny dense transformer LM (GPU)
+# Tiny dense transformer LM (GPU) + RMSNorm/QK-Norm/GQA/SwiGLU
 # -------------------------
+class RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.eps = eps
+    def forward(self, x):
+        rms = x.pow(2).mean(dim=-1, keepdim=True)
+        x = x * torch.rsqrt(rms + self.eps)
+        return x * self.weight
+
 class CausalSelfAttention(nn.Module):
-    def __init__(self, d_model: int, n_head: int, attn_pdrop=0.0, resid_pdrop=0.0):
+    def __init__(self, d_model: int, n_head: int, n_kv_heads: int,
+                 qk_norm: bool = True, attn_pdrop=0.0, resid_pdrop=0.0):
         super().__init__()
         assert d_model % n_head == 0, "d_model must be divisible by n_head"
+        assert n_head % n_kv_heads == 0, "n_head must be a multiple of n_kv_heads (GQA)"
         self.n_head = n_head
+        self.n_kv = n_kv_heads
         self.head_dim = d_model // n_head
-        self.qkv = nn.Linear(d_model, 3*d_model, bias=False)
+        # merged QKV for GQA: (n_head + 2*n_kv) * head_dim
+        qkv_out = (n_head + 2 * n_kv_heads) * self.head_dim
+        self.qkv = nn.Linear(d_model, qkv_out, bias=False)
         self.proj = nn.Linear(d_model, d_model, bias=False)
         self.attn_drop = nn.Dropout(attn_pdrop)
         self.resid_drop = nn.Dropout(resid_pdrop)
-        # no explicit mask; we'll use is_causal=True in SDPA
-
-    # no _causal_mask needed with SDPA
+        self.qk_norm = qk_norm
+        if qk_norm:
+            self.q_scale = nn.Parameter(torch.ones(self.head_dim))
+            self.k_scale = nn.Parameter(torch.ones(self.head_dim))
 
     def forward(self, x):
         B, T, C = x.shape
-        qkv = self.qkv(x)  # [B,T,3C]
-        q, k, v = qkv.split(C, dim=-1)
-        # [B, nH, T, Hd]
+        qkv = self.qkv(x)
+        q, k, v = torch.split(
+            qkv, [self.n_head*self.head_dim, self.n_kv*self.head_dim, self.n_kv*self.head_dim], dim=-1
+        )
         q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-        k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-        v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-        # Flash/MemEff/Math SDPA (PyTorch chooses best kernel)
-        import torch.nn.functional as F
+        k = k.view(B, T, self.n_kv,   self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.n_kv,   self.head_dim).transpose(1, 2)
+        if self.qk_norm:
+            q = q * torch.rsqrt(q.pow(2).mean(dim=-1, keepdim=True) + 1e-6)
+            k = k * torch.rsqrt(k.pow(2).mean(dim=-1, keepdim=True) + 1e-6)
+            q = q * self.q_scale
+            k = k * self.k_scale
+        if self.n_kv != self.n_head:
+            repeat = self.n_head // self.n_kv
+            k = k.repeat_interleave(repeat, dim=1)
+            v = v.repeat_interleave(repeat, dim=1)
         y = F.scaled_dot_product_attention(
             q, k, v,
             attn_mask=None,
             dropout_p=self.attn_drop.p if self.training else 0.0,
             is_causal=True,
-            scale=None,  # let kernel pick default 1/sqrt(d)
-        )  # [B,nH,T,Hd]
+        )
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.resid_drop(self.proj(y))
         return y
 
 class MLP(nn.Module):
-    def __init__(self, d_model, expansion=4, pdrop=0.0):
+    def __init__(self, d_model, pdrop=0.0):
         super().__init__()
-        self.fc1 = nn.Linear(d_model, expansion*d_model, bias=False)
-        self.act = nn.GELU()
-        self.fc2 = nn.Linear(expansion*d_model, d_model, bias=False)
+        hidden = int((8.0/3.0) * d_model)
+        self.up_g = nn.Linear(d_model, hidden, bias=False)
+        self.up_f = nn.Linear(d_model, hidden, bias=False)
+        self.down = nn.Linear(hidden, d_model, bias=False)
         self.drop = nn.Dropout(pdrop)
-
     def forward(self, x):
-        return self.drop(self.fc2(self.act(self.fc1(x))))
+        g = F.silu(self.up_g(x))
+        f = self.up_f(x)
+        return self.drop(self.down(g * f))
 
 class Block(nn.Module):
-    def __init__(self, d_model, n_head, attn_pdrop=0.0, resid_pdrop=0.0, mlp_pdrop=0.0, checkpoint=False):
+    def __init__(self, d_model, n_head, n_kv_heads, qk_norm=True,
+                 attn_pdrop=0.0, resid_pdrop=0.0, mlp_pdrop=0.0, checkpoint=False):
         super().__init__()
-        self.ln1 = nn.LayerNorm(d_model)
-        self.attn = CausalSelfAttention(d_model, n_head, attn_pdrop, resid_pdrop)
-        self.ln2 = nn.LayerNorm(d_model)
+        self.ln1 = RMSNorm(d_model)
+        self.attn = CausalSelfAttention(d_model, n_head, n_kv_heads, qk_norm, attn_pdrop, resid_pdrop)
+        self.ln2 = RMSNorm(d_model)
         self.mlp = MLP(d_model, pdrop=mlp_pdrop)
         self.checkpoint = checkpoint
 
@@ -134,22 +160,25 @@ class TinyTransformerLM(nn.Module):
         vocab_size=32000,
         n_layer=12,
         n_head=11,
+        n_kv_heads=11,
         d_model=704,
         block_size=1024,
         pdrop=0.1,
         checkpoint=False,
+        qk_norm=True,
     ):
         super().__init__()
         assert d_model % n_head == 0
+        assert n_head % n_kv_heads == 0
         self.vocab_size, self.block_size = vocab_size, block_size
         self.tok_emb = nn.Embedding(vocab_size, d_model)
         self.pos_emb = nn.Embedding(block_size, d_model)
         self.drop = nn.Dropout(pdrop)
         self.blocks = nn.ModuleList([
-            Block(d_model, n_head, pdrop, pdrop, pdrop, checkpoint=checkpoint)
+            Block(d_model, n_head, n_kv_heads, qk_norm, pdrop, pdrop, pdrop, checkpoint=checkpoint)
             for _ in range(n_layer)
         ])
-        self.ln_f = nn.LayerNorm(d_model)
+        self.ln_f = RMSNorm(d_model)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
         # tie weights
         self.lm_head.weight = self.tok_emb.weight
@@ -306,66 +335,19 @@ class MuonSophiaSingleDevice:
         self.sophia.update_hessian()
 
 def build_optimizer(kind: str, model: nn.Module, foreach=True, fused=True,
-                    muon_lr=2e-2, muon_wd=1e-2,
-                    sophia_lr=6e-4, sophia_b1=0.965, sophia_b2=0.99, sophia_rho=0.05, sophia_wd=0.2):
+                    muon_lr=3e-2, muon_wd=1e-2,
+                    sophia_lr=1e-3, sophia_b1=0.965, sophia_b2=0.99, sophia_rho=0.1, sophia_wd=0.2):
+    """Muon + Sophia only (composite)."""
     kind = kind.lower()
-    if kind == "adamw":
-        # fused & foreach cannot both be True on many builds.
-        use_fused = bool(fused and torch.cuda.is_available())
-        use_foreach = bool(foreach)
-        if use_fused and use_foreach:
-            # Prefer fused on GPU; disable foreach automatically.
-            use_foreach = False
-        try:
-            opt = torch.optim.AdamW(
-                model.parameters(),
-                lr=3e-4, betas=(0.9, 0.95), weight_decay=0.01,
-                foreach=use_foreach, fused=use_fused
-            )
-        except TypeError:
-            # Older PyTorch without the 'fused' kwarg.
-            opt = torch.optim.AdamW(
-                model.parameters(),
-                lr=3e-4, betas=(0.9, 0.95), weight_decay=0.01,
-                foreach=use_foreach
-            )
-        except RuntimeError as e:
-            # Last-resort fallback: drop fused and use foreach if combo rejected.
-            msg = str(e)
-            if "fused" in msg or "`fused` and `foreach` cannot be `True`" in msg:
-                opt = torch.optim.AdamW(
-                    model.parameters(),
-                    lr=3e-4, betas=(0.9, 0.95), weight_decay=0.01,
-                    foreach=True
-                )
-            else:
-                raise
-        return opt, None
-    elif kind == "muon_adamw":
-        from muon import SingleDeviceMuonWithAuxAdam as MuonWithAuxAdam
-        hidden, aux = split_params_for_muon(model)
-        param_groups = [
-            dict(params=hidden, use_muon=True,  lr=muon_lr, weight_decay=muon_wd, momentum=0.95),
-            dict(params=aux,    use_muon=False, lr=3e-4, betas=(0.9,0.95), weight_decay=muon_wd),
-        ]
-        return MuonWithAuxAdam(param_groups), None
-    elif kind == "muon_sophia":
-        hidden, aux = split_params_for_muon(model)
-        opt = MuonSophiaSingleDevice(
-            hidden, aux,
-            muon_kw=dict(lr=muon_lr, weight_decay=muon_wd, momentum=0.95),
-            sophia_kw=dict(lr=sophia_lr, betas=(sophia_b1, sophia_b2),
-                           rho=sophia_rho, weight_decay=sophia_wd),
-        )
-        return opt, dict(k_hess=10)
-    elif kind == "sophia":
-        # Sophia-G on ALL params (no Muon). Needs bs=... and update_hessian() in the loop.
-        from sophia import SophiaG
-        opt = SophiaG(model.parameters(), lr=sophia_lr, betas=(sophia_b1, sophia_b2),
-                      rho=sophia_rho, weight_decay=sophia_wd)
-        return opt, dict(k_hess=10)
-    else:
-        raise ValueError(f"Unknown optimizer: {kind}")
+    if kind not in {"muon_sophia", "muon+sophia", "ms"}:
+        raise ValueError("This build only supports Muon+Sophia. Use --opt-list muon_sophia")
+    hidden, aux = split_params_for_muon(model)
+    opt = MuonSophiaSingleDevice(
+        hidden, aux,
+        muon_kw=dict(lr=muon_lr, weight_decay=muon_wd, momentum=0.95),
+        sophia_kw=dict(lr=sophia_lr, betas=(sophia_b1, sophia_b2), rho=sophia_rho, weight_decay=sophia_wd),
+    )
+    return opt, dict(k_hess=10)
 
 # -------------------------
 # Train loop (GPU, BF16 AMP, compile)
@@ -392,9 +374,12 @@ def train_once(
     amp_dtype: torch.dtype,
     k_hess_override: Optional[int],
     log_every: int=50,
+    k_hess_after: Optional[int]=None,
+    k_hess_switch_step: int=0,
     val_every: int=0,
     val_iters: int=50,
     val_batcher: Optional[LoaderBatcher]=None,
+    clip_val: float = 0.0,
 ) -> RunResult:
     scaler = None  # bf16: no scaler needed; fp16: enable GradScaler
     if amp_dtype == torch.float16:
@@ -440,6 +425,7 @@ def train_once(
     torch.cuda.synchronize()
     t_start = time.perf_counter()
 
+    toks_per_it = bsz * seq * grad_accum
     while iter_num < steps:
         t0 = time.perf_counter()
         # bsz, seq may change if you alter data settings; keep tokens/iter accurate
@@ -461,7 +447,7 @@ def train_once(
                 (loss / grad_accum).backward()
         avg_loss = total_loss / max(1, grad_accum)
         # step
-        bs = bsz * seq * grad_accum
+        bs = toks_per_it
         if sophia_cfg is None:
             if scaler:
                 scaler.step(opt); scaler.update()
@@ -470,8 +456,13 @@ def train_once(
         else:
             if scaler:
                 scaler.unscale_(opt)  # sophia expects real grads; but usually fine without
+            # optional grad clip
+            if clip_val and clip_val > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), clip_val)
             opt.step(bs=bs)
             k = sophia_cfg.get("k_hess", 10)
+            if k_hess_after and (iter_num + 1) >= k_hess_switch_step:
+                k = k_hess_after
             if (iter_num + 1) % k == 0:
                 # extra sampled pass for Hessian EMA
                 x,y = data.next_batch(device)
@@ -507,7 +498,6 @@ def train_once(
                   f"loss {losses[-1]:.4f}  avg {1e3*stats.mean(times):6.2f} ms/it")
 
     mean_s = stats.mean(times)
-    toks_per_it = bsz * seq * grad_accum
     return RunResult(
         name=name,
         mean_ms=mean_s*1e3,
@@ -525,22 +515,26 @@ def main():
     ap.add_argument("--block-size", type=int, default=1024)
     ap.add_argument("--pdrop", type=float, default=0.1)
     ap.add_argument("--ckpt", action="store_true", default=False)
+    ap.add_argument("--qk-norm", action="store_true", default=True)
     # data
     ap.add_argument("--batch", type=int, default=8)        # micro-batch
     ap.add_argument("--steps", type=int, default=400)
     ap.add_argument("--grad-accum", type=int, default=1)   # increase for larger effective batch
     # optimizers
-    ap.add_argument("--opt-list", type=str, default="adamw,muon_adamw,muon_sophia,sophia")
+    ap.add_argument("--opt-list", type=str, default="muon_sophia", help="This build only supports muon_sophia")
     ap.add_argument("--foreach", action="store_true", default=True, help="Use foreach AdamW. If --fused is set, foreach is auto-disabled.")
     ap.add_argument("--fused", action="store_true", default=True, help="Use fused AdamW on GPU. Incompatible with --foreach.")
     ap.add_argument("--k-hess", type=int, default=10)
-    ap.add_argument("--muon-lr", type=float, default=2e-2)
+    ap.add_argument("--k-hess-after", type=int, default=0, help="0=disabled; use this k after switch")
+    ap.add_argument("--k-hess-switch-step", type=int, default=0, help="step to switch cadence")
+    ap.add_argument("--muon-lr", type=float, default=3e-2)
     ap.add_argument("--muon-wd", type=float, default=1e-2)
-    ap.add_argument("--sophia-lr", type=float, default=6e-4)
+    ap.add_argument("--sophia-lr", type=float, default=1e-3)
     ap.add_argument("--sophia-b1", type=float, default=0.965)
     ap.add_argument("--sophia-b2", type=float, default=0.99)
-    ap.add_argument("--sophia-rho", type=float, default=0.05)
+    ap.add_argument("--sophia-rho", type=float, default=0.1)
     ap.add_argument("--sophia-wd", type=float, default=0.2)
+    ap.add_argument("--clip-grad", type=float, default=1.0)
     # data/tokenizer (HF)
     ap.add_argument("--dataset", type=str, default="", help="HF dataset name, e.g. 'wikitext' or 'openwebtext'; empty = synthetic")
     ap.add_argument("--dataset-config", type=str, default="",
@@ -645,10 +639,12 @@ def main():
         vocab_size=args.vocab,
         n_layer=args.layers,
         n_head=args.heads,
+        n_kv_heads=max(1, args.heads // 4),
         d_model=args.d_model,
         block_size=args.block_size,
         pdrop=args.pdrop,
         checkpoint=args.ckpt,
+        qk_norm=args.qk_norm,
     )
     # resize embeddings if tokenizer added new tokens (rare if using pretrained tokenizer path)
     # (weight tying is already in place)
@@ -686,7 +682,9 @@ def main():
         # fresh model and fresh data stream (same seed for fairness)
         m = TinyTransformerLM(
             vocab_size=args.vocab, n_layer=args.layers, n_head=args.heads,
-            d_model=args.d_model, block_size=args.block_size, pdrop=args.pdrop, checkpoint=args.ckpt
+            n_kv_heads=max(1, args.heads // 4), d_model=args.d_model,
+            block_size=args.block_size, pdrop=args.pdrop, checkpoint=args.ckpt,
+            qk_norm=args.qk_norm
         )
         m.load_state_dict(state_dict)  # same init for fair comparison
         data = batcher_factory()  # fresh iterator / generator per optimizer
@@ -704,10 +702,13 @@ def main():
             grad_accum=args.grad_accum,
             amp_dtype=amp_dtype,
             k_hess_override=args.k_hess,
+            k_hess_after=(args.k_hess_after or None),
+            k_hess_switch_step=args.k_hess_switch_step,
             log_every=max(20, args.steps//5),
             val_every=args.val_every,
             val_iters=args.val_iters,
             val_batcher=val_batcher,
+            clip_val=args.clip_grad,
         )
         results.append(r)
         if csvw:
