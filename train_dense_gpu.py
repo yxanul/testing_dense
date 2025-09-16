@@ -396,6 +396,7 @@ def train_once(
         model = torch.compile(model, backend="inductor", dynamic=dynamic_shapes)
 
     times=[]; losses=[]; iter_num=0
+    last_grad_norm = None
     # Warmup & trigger compile
     x,y = data.next_batch(device)
     model.train(); opt.zero_grad(set_to_none=True)
@@ -456,9 +457,12 @@ def train_once(
         else:
             if scaler:
                 scaler.unscale_(opt)  # sophia expects real grads; but usually fine without
-            # optional grad clip
+            # optional grad clip; record norm for logging
             if clip_val and clip_val > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), clip_val)
+                try:
+                    last_grad_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), clip_val))
+                except Exception:
+                    last_grad_norm = None
             opt.step(bs=bs)
             k = sophia_cfg.get("k_hess", 10)
             if k_hess_after and (iter_num + 1) >= k_hess_switch_step:
@@ -494,8 +498,16 @@ def train_once(
             model.train()
             print(f"[{name:12s}]   (val) loss {vl:.4f}  ppl {vp:.1f}")
         if (iter_num % log_every == 0) or (iter_num == steps):
+            ms_avg = 1e3*stats.mean(times)
+            tok_s = toks_per_it / stats.mean(times)
+            if clip_val and clip_val > 0 and last_grad_norm is not None:
+                gmsg = f"  gnorm {last_grad_norm:.2f}/{clip_val:g}"
+            elif clip_val and clip_val > 0:
+                gmsg = f"  gnorm ?/{clip_val:g}"
+            else:
+                gmsg = ""
             print(f"[{name:12s}] step {iter_num:4d}/{steps}  "
-                  f"loss {losses[-1]:.4f}  avg {1e3*stats.mean(times):6.2f} ms/it")
+                  f"loss {losses[-1]:.4f}  avg {ms_avg:6.2f} ms/it  {tok_s:7.0f} tok/s" + gmsg)
 
     mean_s = stats.mean(times)
     return RunResult(
