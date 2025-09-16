@@ -593,7 +593,7 @@ def main():
             tok.pad_token = tok.eos_token
         # pad tokenizer vocab to a multiple of 128 for kernel alignment (testing speedup)
         _m = 128
-        _v0 = int(tok.vocab_size)
+        _v0 = int(len(tok))  # include any already-added tokens
         _target = ((_v0 + _m - 1) // _m) * _m
         _n_add = _target - _v0
         if _n_add > 0:
@@ -601,9 +601,9 @@ def main():
             # keep pad token if requested
             if args.eos_as_pad and (tok.pad_token is None):
                 tok.pad_token = tok.eos_token
-            print(f"Padded tokenizer vocab from {_v0} to {tok.vocab_size} (x{_m}).")
+            print(f"Padded tokenizer vocab from {_v0} to {len(tok)} (x{_m}).")
         # update vocab size to tokenizer size (possibly padded)
-        args.vocab = int(tok.vocab_size)
+        args.vocab = int(len(tok))
         # build streaming dataset and loader
         stream = HFStreamPacker(
             ds_name=ds_name,
