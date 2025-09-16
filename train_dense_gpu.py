@@ -1,5 +1,5 @@
 import os
-import time, math, argparse, statistics as stats, itertools
+import time, math, argparse, statistics as stats, itertools, csv, pathlib
 from dataclasses import dataclass
 from typing import List, Tuple, Optional
 # Delay setting TORCH_LOGS until after imports to avoid logging initialization issues
@@ -236,10 +236,8 @@ class LoaderBatcher:
         self.it = None
         # expose for accounting
         self.block_size = int(block_size)
-        try:
-            self.batch_size = int(loader.batch_size) if loader.batch_size is not None else None
-        except Exception:
-            self.batch_size = None
+        # if DataLoader has a static batch_size, use it (helpful for logging)
+        self.batch_size = int(loader.batch_size) if loader.batch_size is not None else None
     def _next_tensor(self):
         if self.it is None:
             self.it = iter(self.loader)
@@ -255,6 +253,21 @@ class LoaderBatcher:
         y = batch[:, 1: ].contiguous().to(device, non_blocking=True)
         return x, y
 
+@torch.inference_mode()
+def eval_stream_ppl(model, batcher: LoaderBatcher, iters: int, amp_dtype: torch.dtype):
+    """Quick validation on a streaming loader; returns (mean_loss, ppl)."""
+    losses = []
+    for _ in range(iters):
+        x, y = batcher.next_batch(device=next(model.parameters()).device.type)
+        with torch.amp.autocast('cuda', dtype=amp_dtype):
+            _, loss = model(x, y)
+        losses.append(float(loss))
+    m = sum(losses)/len(losses)
+    try:
+        ppl = math.exp(m)
+    except OverflowError:
+        ppl = float("inf")
+    return m, ppl
 # -------------------------
 # Optimizers (local muon/sophia)
 # -------------------------
@@ -379,6 +392,9 @@ def train_once(
     amp_dtype: torch.dtype,
     k_hess_override: Optional[int],
     log_every: int=50,
+    val_every: int=0,
+    val_iters: int=50,
+    val_batcher: Optional[LoaderBatcher]=None,
 ) -> RunResult:
     scaler = None  # bf16: no scaler needed; fp16: enable GradScaler
     if amp_dtype == torch.float16:
@@ -429,6 +445,7 @@ def train_once(
         # bsz, seq may change if you alter data settings; keep tokens/iter accurate
         # (we already have bsz/seq from warmup; if you want to re-infer every iter,
         #  uncomment the next two lines after fetching x,y)
+        # bsz, seq = x.size(0), x.size(1)
         total_loss = 0.0
         for micro in range(grad_accum):
             x,y = data.next_batch(device)
@@ -479,6 +496,12 @@ def train_once(
         times.append(t1 - t0)
         losses.append(avg_loss)
         iter_num += 1
+        do_val = val_every and val_batcher is not None and (iter_num % val_every == 0)
+        if do_val:
+            model.eval()
+            vl, vp = eval_stream_ppl(model, val_batcher, iters=val_iters, amp_dtype=amp_dtype)
+            model.train()
+            print(f"[{name:12s}]   (val) loss {vl:.4f}  ppl {vp:.1f}")
         if (iter_num % log_every == 0) or (iter_num == steps):
             print(f"[{name:12s}] step {iter_num:4d}/{steps}  "
                   f"loss {losses[-1]:.4f}  avg {1e3*stats.mean(times):6.2f} ms/it")
@@ -528,6 +551,12 @@ def main():
     ap.add_argument("--shuffle-buffer", type=int, default=1000, help="approx shuffle buffer for streaming")
     ap.add_argument("--eos-as-pad", action="store_true", default=True, help="set pad_token=eos if tokenizer has no pad")
     ap.add_argument("--synthetic-vocab", type=int, default=32000, help="vocab for synthetic mode")
+    ap.add_argument("--prefetch-factor", type=int, default=8)
+    # validation + logging
+    ap.add_argument("--val-split", type=str, default="validation")
+    ap.add_argument("--val-iters", type=int, default=50)
+    ap.add_argument("--val-every", type=int, default=0, help="evaluate every N steps (0=off)")
+    ap.add_argument("--csv", type=str, default="", help="optional CSV log path")
     # compile/amp
     ap.add_argument("--compile", action="store_true", default=True)
     ap.add_argument("--dynamic", action="store_true", default=False)
@@ -550,6 +579,7 @@ def main():
 
     # tokenizer / dataset
     use_hf_data = bool(args.dataset)
+    val_batcher = None
     if use_hf_data:
         # map short names (e.g. "openwebtext" -> "Skylion007/openwebtext")
         ds_name, ds_config = resolve_dataset_and_config(args.dataset, args.dataset_config if args.dataset_config else None)
@@ -575,14 +605,29 @@ def main():
         )
         loader = torch.utils.data.DataLoader(
             stream, batch_size=args.batch, num_workers=args.num_workers,
-            pin_memory=True, drop_last=True, collate_fn=lambda x: torch.stack(x, dim=0)
+            pin_memory=True, drop_last=True, collate_fn=lambda x: torch.stack(x, dim=0),
+            persistent_workers=True, prefetch_factor=args.prefetch_factor
         )
         batcher_factory = lambda: LoaderBatcher(loader, args.block_size)
+        # validation loader (optional; ignore failures gracefully)
+        try:
+            vname, vcfg = resolve_dataset_and_config(args.dataset, args.dataset_config if args.dataset_config else None)
+            vs = HFStreamPacker(vname, vcfg, split=args.val_split, tokenizer=tok,
+                                block_size=args.block_size, seed=4321, shuffle_buffer=args.shuffle_buffer//2 or 1000)
+            vloader = torch.utils.data.DataLoader(
+                vs, batch_size=args.batch, num_workers=max(1, args.num_workers//2),
+                pin_memory=True, drop_last=True, collate_fn=lambda x: torch.stack(x, dim=0),
+                persistent_workers=True, prefetch_factor=max(2, args.prefetch_factor//2)
+            )
+            val_batcher = LoaderBatcher(vloader, args.block_size)
+        except Exception as _:
+            val_batcher = None
     else:
         # synthetic fallback
         if args.vocab is None or args.vocab <= 0:
             args.vocab = args.synthetic_vocab
         batcher_factory = lambda: DataGen(args.vocab, args.block_size, args.batch, seed=1234)
+        val_batcher = None
 
     # build base model & report params (init weights once; copy per optimizer)
     model = TinyTransformerLM(
@@ -616,6 +661,15 @@ def main():
     # run each optimizer on fresh copy (same init) + fresh data stream
     state_dict = model.state_dict()
     results: List[RunResult] = []
+    csvw = None
+    f = None
+    if args.csv:
+        path = pathlib.Path(args.csv)
+        first = not path.exists()
+        f = path.open("a", newline="")
+        csvw = csv.writer(f)
+        if first:
+            csvw.writerow(["opt", "step", "train_loss", "ms_per_it", "val_loss", "val_ppl"])
     for opt_name in [s.strip() for s in args.opt_list.split(",") if s.strip()]:
         print(f"\n=== {opt_name} ===")
         # fresh model and fresh data stream (same seed for fairness)
@@ -640,8 +694,17 @@ def main():
             amp_dtype=amp_dtype,
             k_hess_override=args.k_hess,
             log_every=max(20, args.steps//5),
+            val_every=args.val_every,
+            val_iters=args.val_iters,
+            val_batcher=val_batcher,
         )
         results.append(r)
+        if csvw:
+            csvw.writerow([opt_name, args.steps, f"{r.final_loss:.6f}", f"{r.mean_ms:.3f}", "", ""])
+            f.flush()
+
+    if f:
+        f.close()
 
     # summary
     print("\n=== Summary (GPU) ===")
@@ -652,3 +715,18 @@ def main():
 if __name__ == "__main__":
     os.environ.setdefault("TORCH_LOGS","")   # quieter
     main()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
