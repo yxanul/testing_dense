@@ -60,6 +60,19 @@ def set_cuda_env():
         pass
 
 # -------------------------
+# Head utility
+# -------------------------
+def pick_kv_heads(n_head: int, prefer: int) -> int:
+    """Pick a KV head count that divides n_head, close to prefer (<= prefer).
+    Falls back to 1 if no smaller divisor exists (e.g., n_head is prime).
+    """
+    prefer = max(1, min(prefer, n_head))
+    for k in range(prefer, 0, -1):
+        if n_head % k == 0:
+            return k
+    return 1
+
+# -------------------------
 # Tiny dense transformer LM (GPU) + RMSNorm/QK-Norm/GQA/SwiGLU
 # -------------------------
 class RMSNorm(nn.Module):
@@ -647,11 +660,16 @@ def main():
         val_batcher = None
 
     # build base model & report params (init weights once; copy per optimizer)
+    # choose valid KV heads (GQA); fallback to a divisor of heads
+    _prefer_kv = args.heads // 4
+    _kv = pick_kv_heads(args.heads, _prefer_kv)
+    if _kv != max(1, _prefer_kv):
+        print(f"[info] Adjusted n_kv_heads from {max(1,_prefer_kv)} to {_kv} to divide heads={args.heads}")
     model = TinyTransformerLM(
         vocab_size=args.vocab,
         n_layer=args.layers,
         n_head=args.heads,
-        n_kv_heads=max(1, args.heads // 4),
+        n_kv_heads=_kv,
         d_model=args.d_model,
         block_size=args.block_size,
         pdrop=args.pdrop,
@@ -694,7 +712,7 @@ def main():
         # fresh model and fresh data stream (same seed for fairness)
         m = TinyTransformerLM(
             vocab_size=args.vocab, n_layer=args.layers, n_head=args.heads,
-            n_kv_heads=max(1, args.heads // 4), d_model=args.d_model,
+            n_kv_heads=_kv, d_model=args.d_model,
             block_size=args.block_size, pdrop=args.pdrop, checkpoint=args.ckpt,
             qk_norm=args.qk_norm
         )
