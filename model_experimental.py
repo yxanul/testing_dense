@@ -232,6 +232,7 @@ class MoE(nn.Module):
         self.dropout = nn.Dropout(dropout)
         # compiled expert-apply (lazy)
         self._compiled_apply = None
+        self._compiled_apply_grouped = None
 
         # Fast path when n_experts=1 -> just dense SwiGLU
         self._dense_fallback = (n_experts == 1)
@@ -239,6 +240,77 @@ class MoE(nn.Module):
             self.dense = ExpertSwiGLU(d_model, bias=bias, dropout=dropout)
 
     def _apply_experts_dropless(self, x_flat: torch.Tensor, top1_idx: torch.Tensor, top1_p: torch.Tensor) -> torch.Tensor:
+        y_flat = torch.zeros_like(x_flat)
+        for e in range(self.n_experts):
+            mask = (top1_idx == e)
+            if mask.any():
+                xe = x_flat[mask]
+                ye = self.experts[e](xe)
+                if ye.dtype != x_flat.dtype:
+                    ye = ye.to(x_flat.dtype)
+                ye = ye * top1_p[mask].unsqueeze(-1)
+                y_flat[mask] = ye
+        return y_flat
+
+    
+
+    def _apply_experts_dropless_grouped(self, x_flat: torch.Tensor, top1_idx: torch.Tensor, top1_p: torch.Tensor) -> torch.Tensor:
+        device = x_flat.device
+        dtype = x_flat.dtype
+        N = x_flat.size(0)
+        d = x_flat.size(1)
+        # counts per expert and cap
+        counts = []
+        idx_lists = []
+        for e in range(self.n_experts):
+            routed = (top1_idx == e)
+            if routed.any():
+                idx_e = torch.nonzero(routed, as_tuple=False).squeeze(-1)
+            else:
+                idx_e = torch.empty(0, dtype=torch.long, device=device)
+            counts.append(int(idx_e.numel()))
+            idx_lists.append(idx_e)
+        cap = max(1, max(counts) if counts else 1)
+        # pad and stack to [E, cap]
+        padded = []
+        for idx_e in idx_lists:
+            if idx_e.numel() < cap:
+                pad = torch.full((cap - idx_e.numel(),), -1, dtype=torch.long, device=device)
+                idx_e = torch.cat([idx_e, pad], dim=0)
+            else:
+                idx_e = idx_e[:cap]
+            padded.append(idx_e)
+        idx_mat = torch.stack(padded, dim=0)
+        valid_mask = (idx_mat >= 0)
+        safe_idx = idx_mat.clamp_min(0)
+        x_grouped = x_flat[safe_idx]  # [E, cap, d]
+        gate_grouped = torch.zeros((self.n_experts, cap, 1), device=device, dtype=dtype)
+        top1_p_grouped = top1_p[safe_idx]
+        gate_grouped[valid_mask] = top1_p_grouped[valid_mask].unsqueeze(-1).to(dtype)
+        # Stack weights and biases
+        Wu = torch.stack([exp.up_u.weight for exp in self.experts], dim=0).to(dtype)  # [E, hidden, d]
+        WuT = Wu.transpose(1, 2)
+        bu = torch.stack([exp.up_u.bias if exp.up_u.bias is not None else torch.zeros(exp.up_u.out_features, device=device, dtype=dtype) for exp in self.experts], dim=0).to(dtype)
+        Wv = torch.stack([exp.up_v.weight for exp in self.experts], dim=0).to(dtype)
+        WvT = Wv.transpose(1, 2)
+        bv = torch.stack([exp.up_v.bias if exp.up_v.bias is not None else torch.zeros(exp.up_v.out_features, device=device, dtype=dtype) for exp in self.experts], dim=0).to(dtype)
+        WdT = torch.stack([exp.down.weight.t() for exp in self.experts], dim=0).to(dtype)
+        bd = torch.stack([exp.down.bias if exp.down.bias is not None else torch.zeros(exp.down.out_features, device=device, dtype=dtype) for exp in self.experts], dim=0).to(dtype)
+        # Batched GEMMs
+        U = torch.bmm(x_grouped, WuT) + bu.unsqueeze(1)
+        V = torch.bmm(x_grouped, WvT) + bv.unsqueeze(1)
+        H = swiglu(U, V)
+        Y = torch.bmm(H, WdT) + bd.unsqueeze(1)
+        Y = Y * gate_grouped
+        Y = Y.masked_fill(~valid_mask.unsqueeze(-1), 0)
+        # Scatter back
+        y_flat = torch.zeros_like(x_flat)
+        for e in range(self.n_experts):
+            cnt = counts[e]
+            if cnt > 0:
+                idx_valid = idx_mat[e, :cnt]
+                y_flat.index_copy_(0, idx_valid, Y[e, :cnt].to(dtype))
+        return y_flat
         # Expert application with top-1 weighting; compiled variant (dynamic=True)
         y_flat = torch.zeros_like(x_flat)
         for e in range(self.n_experts):
@@ -265,19 +337,25 @@ class MoE(nn.Module):
 
         if self.router.dropless:
             # Dropless: process all tokens by their chosen expert and scatter back
-            # lazy-compile expert application once
-            if self._compiled_apply is None:
-                try:
-                    self._compiled_apply = torch.compile(
-                        self._apply_experts_dropless,
-                        backend="inductor",
-                        dynamic=True,
-                        fullgraph=False,
-                        mode="reduce-overhead",
-                    )
-                except Exception:
-                    self._compiled_apply = self._apply_experts_dropless  # fallback
-            y_flat = self._compiled_apply(x_flat, top1_idx, top1_p)
+            # choose expert application path
+            if self.grouped:
+                if self._compiled_apply_grouped is None:
+                    try:
+                        self._compiled_apply_grouped = torch.compile(
+                            self._apply_experts_dropless_grouped, backend="inductor", dynamic=True, fullgraph=False, mode="reduce-overhead"
+                        )
+                    except Exception:
+                        self._compiled_apply_grouped = self._apply_experts_dropless_grouped
+                y_flat = self._compiled_apply_grouped(x_flat, top1_idx, top1_p)
+            else:
+                if self._compiled_apply is None:
+                    try:
+                        self._compiled_apply = torch.compile(
+                            self._apply_experts_dropless, backend="inductor", dynamic=True, fullgraph=False, mode="reduce-overhead"
+                        )
+                    except Exception:
+                        self._compiled_apply = self._apply_experts_dropless
+                y_flat = self._compiled_apply(x_flat, top1_idx, top1_p)
             y = y_flat.reshape(b, t, d)
             # Stats (no drops in dropless)
             with torch.no_grad():
