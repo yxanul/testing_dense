@@ -153,3 +153,90 @@ muon_adamw    328.31 ms/it       49904 tok/s   loss 6.3615
 
 
 It seems like muon sophia is the right choice. 
+
+
+
+python train_dense_gpu.py --dataset c4 --dataset-config en --split train --tokenizer gpt2 --layers 12 --heads 11 --d-model 704 --block-size 1024 --batch 8 --grad-accum 8 --steps 6000 --compile --a
+mp bf16 --opt-list muon_sophia --num-workers 4 --shuffle-buffer 4000 --prefetch-factor 8 --qk-norm --clip-grad 1.0 --k-h
+ess 10 --k-hess-after 20 --k-hess-switch-step 3500 --val-split validation --val-every 300 --val-iters 50 --csv runs/c4_g
+pt2_pad128_ms_s3000.csv
+
+
+[muon_sophia ]   (val) loss 7.2744  ppl 1442.8
+[muon_sophia ]   (val) loss 6.4469  ppl 630.7
+[muon_sophia ]   (val) loss 5.9387  ppl 379.5
+[muon_sophia ]   (val) loss 5.5469  ppl 256.4
+[muon_sophia ] step 1200/6000  loss 5.6797  avg 1186.83 ms/it    55219 tok/s  gnorm 0.39/1
+[muon_sophia ]   (val) loss 5.1769  ppl 177.1
+[muon_sophia ]   (val) loss 4.9250  ppl 137.7
+[muon_sophia ]   (val) loss 4.7344  ppl 113.8
+[muon_sophia ]   (val) loss 4.6022  ppl 99.7
+[muon_sophia ] step 2400/6000  loss 4.5813  avg 1185.14 ms/it    55298 tok/s  gnorm 0.22/1
+[muon_sophia ]   (val) loss 4.5119  ppl 91.1
+[muon_sophia ]   (val) loss 4.4825  ppl 88.5
+[muon_sophia ]   (val) loss 4.4159  ppl 82.8
+[muon_sophia ]   (val) loss 4.3291  ppl 75.9
+[muon_sophia ] step 3600/6000  loss 4.5154  avg 1183.83 ms/it    55359 tok/s  gnorm 0.14/1
+[muon_sophia ]   (val) loss 4.3525  ppl 77.7
+[muon_sophia ]   (val) loss 4.2697  ppl 71.5
+[muon_sophia ]   (val) loss 4.1272  ppl 62.0
+[muon_sophia ]   (val) loss 4.1750  ppl 65.0
+[muon_sophia ] step 4800/6000  loss 4.3788  avg 1182.11 ms/it    55440 tok/s  gnorm 0.11/1
+[muon_sophia ]   (val) loss 4.2562  ppl 70.5
+[muon_sophia ]   (val) loss 4.0869  ppl 59.6
+[muon_sophia ]   (val) loss 4.0919  ppl 59.9
+[muon_sophia ]   (val) loss 4.0659  ppl 58.3
+[muon_sophia ] step 6000/6000  loss 4.2547  avg 1181.02 ms/it    55491 tok/s  gnorm 0.10/1
+
+=== Summary (GPU) ===
+muon_sophia  1181.02 ms/it       55491 tok/s   loss 4.2547
+
+
+
+
+
+
+
+
+
+
+
+
+MOE MOE MOE MOE MOE MOE MOE 
+PowerShell-friendly command
+
+Log in first: huggingface-cli login
+Then run:
+python train_experimental.py
+--device cuda
+--dataset_name HuggingFaceFW/fineweb-edu --dataset_config sample-10BT
+--n_experts 8 --dropless
+--load_balance_alpha 0.12
+--router_z_loss_coef 1e-3
+--router_temp_init 2.2 --router_temp_final 1.3 --router_temp_anneal_iters 5000
+--router_noise_std_init 0.9 --router_noise_decay_iters 5000
+--router_noise_type gumbel
+--attn_gate sigmoid_head --qk_norm --use_rope
+--batch_size 8 --gradient_accumulation_steps 8
+--learning_rate 8e-4
+--max_iters 8000 --lr_decay_iters 8000 --warmup_iters 1000
+--eval_interval 200 --eval_iters 50
+What to monitor for non-collapse
+
+Key prints/metrics (already emitted each eval/log step):
+router/max_frac_max: keep well below ~0.90. If it trends ≥0.90, one expert dominates.
+router/active_min: should be >1 and ideally close to number of experts. If ≤1, collapse.
+router/frac_dem_e* vs router/frac_srv_e*: per-expert demand vs served; want reasonably balanced bars.
+router/collapsed: 1 indicates collapse (triggered if either of the above two conditions hit).
+If collapse happens:
+Increase exploration: --router_temp_init 2.5 and/or --router_noise_std_init 1.0.
+Strengthen balancing: raise --load_balance_alpha to 0.15–0.2.
+Keep --router_z_loss_coef in 1e-3–5e-3.
+Quick smoke test (pipeline only)
+
+python train_experimental.py --device cuda --max_iters 5 --eval_interval 1 --eval_iters 1 --batch_size 2 --gradient_accumulation_steps 1
+Notes
+
+Vocab auto-syncs to the Mistral tokenizer; no need to set --vocab_size.
+Eval is derived from the stream; eval_take auto-scales to eval_iters * batch_size.
+You can add --wandb_project ... --wandb_run_name ... to log the router metrics in a dashboard.
