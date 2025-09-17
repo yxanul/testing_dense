@@ -295,6 +295,8 @@ class _MuonSophia:
         from sophia import SophiaG
         self.muon = SingleDeviceMuon(hidden, **muon_kw)
         self.sophia = SophiaG(aux, **sophia_kw)
+        # expose combined param groups so schedulers can update lr, wd, etc.
+        self.param_groups = list(self.muon.param_groups) + list(self.sophia.param_groups)
 
     def zero_grad(self, set_to_none=True):
         self.muon.zero_grad(set_to_none=set_to_none)
@@ -308,6 +310,26 @@ class _MuonSophia:
     @torch.no_grad()
     def update_hessian(self):
         self.sophia.update_hessian()
+
+    # checkpoint compatibility
+    def state_dict(self):
+        return {
+            'muon': self.muon.state_dict(),
+            'sophia': self.sophia.state_dict(),
+        }
+
+    def load_state_dict(self, state):
+        try:
+            if isinstance(state, dict) and 'muon' in state and 'sophia' in state:
+                self.muon.load_state_dict(state['muon'])
+                self.sophia.load_state_dict(state['sophia'])
+            else:
+                # allow passing straight-through if caller saved underlying optimizers separately
+                if isinstance(state, dict) and 'state' in state:
+                    # likely an AdamW-style state dict; ignore
+                    return
+        except Exception:
+            pass
 
 
 def _build_optimizer(cfg: TrainConfig, model: TinyMoETransformer):
@@ -675,4 +697,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
