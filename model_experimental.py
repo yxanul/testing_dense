@@ -473,7 +473,7 @@ class MoE(nn.Module):
                 if self._compiled_apply_grouped is None:
                     try:
                         self._compiled_apply_grouped = torch.compile(
-                            self._apply_experts_dropless_grouped, backend="inductor", dynamic=True, fullgraph=False, mode="reduce-overhead"
+                            self._apply_experts_dropless_grouped, backend="inductor", dynamic=True, fullgraph=False, mode="max-autotune"
                         )
                     except Exception:
                         self._compiled_apply_grouped = self._apply_experts_dropless_grouped
@@ -482,7 +482,7 @@ class MoE(nn.Module):
                 if self._compiled_apply is None:
                     try:
                         self._compiled_apply = torch.compile(
-                            self._apply_experts_dropless, backend="inductor", dynamic=True, fullgraph=False, mode="reduce-overhead"
+                            self._apply_experts_dropless, backend="inductor", dynamic=True, fullgraph=False, mode="max-autotune"
                         )
                     except Exception:
                         self._compiled_apply = self._apply_experts_dropless
@@ -793,7 +793,7 @@ class TransformerBlock(nn.Module):
         # compile attention submodule (shape-stable)
         if use_compile:
             try:
-                self.attn = torch.compile(self.attn, backend="inductor", dynamic=True, fullgraph=False, mode="reduce-overhead")
+                self.attn = torch.compile(self.attn, backend="inductor", dynamic=True, fullgraph=False, mode="max-autotune")
             except Exception:
                 pass
 
