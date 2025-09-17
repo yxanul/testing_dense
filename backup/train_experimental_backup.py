@@ -405,37 +405,27 @@ def train(cfg: TrainConfig):
         moe_grouped=cfg.moe_grouped,
         qk_norm=cfg.qk_norm,
         qk_norm_eps=cfg.qk_norm_eps,
-        compile_submodules=bool(cfg.compile),
     ).to(device=device, dtype=torch.bfloat16)
 
     total_params = model.num_parameters()
     print(f"Model params: {total_params:,} ({total_params/1e6:.2f}M)")
     print(f"Config: layers={cfg.n_layer}, d_model={cfg.d_model}, heads={cfg.n_head}, experts={cfg.n_experts}")
 
-    # Configure inductor for dynamic shapes; warmup to trigger per-submodule compile
-    if cfg.compile:
+    if cfg.compile and hasattr(torch, 'compile'):
         try:
             import torch._inductor.config as inductor_config
-            # Keep cudagraphs off initially for dynamic routing
-            if hasattr(inductor_config.triton, 'cudagraphs'):
-                inductor_config.triton.cudagraphs = False
+            if hasattr(inductor_config.triton, 'cudagraph_skip_dynamic_graphs'):
+                inductor_config.triton.cudagraph_skip_dynamic_graphs = True
+            if hasattr(inductor_config.triton, 'cudagraph_dynamic_shape_warn_limit'):
+                inductor_config.triton.cudagraph_dynamic_shape_warn_limit = None
             if hasattr(inductor_config, 'shape_padding'):
                 inductor_config.shape_padding = True
         except Exception:
             pass
-        # warmup pass to seed dynamic guards
         try:
-            x_warm, y_warm = data.get_batch('train', cfg.batch_size)
-            try:
-                import torch._dynamo as dynamo
-                dynamo.mark_dynamic(x_warm, 0)
-                dynamo.mark_dynamic(x_warm, 1)
-            except Exception:
-                pass
-            with torch.autocast('cuda', dtype=torch.bfloat16):
-                _ = model(x_warm, y_warm)
+            model = torch.compile(model, mode='max-autotune')
         except Exception as e:
-            print(f"compile warmup failed: {e}")
+            print(f"torch.compile failed ({e}); continuing without compile.")
 
     optimizer, sophia_meta = _build_optimizer(cfg, model)
 

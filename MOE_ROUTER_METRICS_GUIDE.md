@@ -229,3 +229,162 @@ iter   2220 | loss 3.6495 | lr 7.437e-04 | 37110 tok/s | r_max 0.19 act_min 8 co
 
 
 python train_experimental.py --device cuda --dataset_name HuggingFaceFW/fineweb-edu --dataset_config sample-10BT --n_experts 8 --dropless --load_balance_alpha 0.12 --router_z_loss_coef 1e-3 --router_temp_init 2.2 --router_temp_final 1.3 --router_temp_anneal_iters 5000 --router_noise_std_init 0.9 --router_noise_decay_iters 5000 --router_noise_type gumbel --attn_gate sigmoid_head --qk_norm --use_rope --batch_size 12 --gradient_accumulation_steps 12 --learning_rate 8e-4 --max_iters 8000 --lr_decay_iters 8000 --warmup_iters 1000 --eval_interval 200 --eval_iters 50 --wandb_project moe-bf16-experiments_v2 --optimizer muon_sophia --muon_lr 3e-2 --muon_wd 1e-2 --sophia_lr 1e-3 --sophia_b1 0.965 --sophia_b2 0.99 --sophia_rho 0.1 --sophia_wd 0.2 --sophia_k 10
+
+
+
+
+root@cec3dd147d8b:/workspace/testing_dense# python train_experimental.py --device cuda --dataset_name HuggingFaceFW/fineweb-edu --dataset_config sample-10BT --n_experts 8 --dropless --load_balance_alpha 0.12 --router_z_loss_coef 1e-3 --rout
+er_temp_init 2.2 --router_temp_final 1.3 --router_temp_anneal_iters 5000 --router_noise_std_init 0.9 --router_noise_deca
+y_iters 5000 --router_noise_type gumbel --attn_gate sigmoid_head --qk_norm --use_rope --batch_size 12 --gradient_accumul
+ation_steps 12 --max_iters 8000 --lr_decay_iters 8000 --warmup_iters 2000 --eval_interval 200 --eval_iters 50 --wandb_pr
+oject moe-bf16-experiments_v2 --optimizer muon_sophia --muon_lr 1e-2 --muon_wd 1e-2 --sophia_lr 6e-4 --sophia_b1 0.965 -
+-sophia_b2 0.99 --sophia_rho 0.1 --sophia_wd 0.2 --sophia_k 10 --log_interval 20
+Estimated params/expert (SwiGLU): ~2.10M for d=512
+Resolving data files: 100%|███████████████████████████████████████████████████████| 2410/2410 [00:00<00:00, 7498.67it/s]
+Model params: 202,952,528 (202.95M)
+Config: layers=10, d_model=512, heads=8, experts=8
+wandb: Currently logged in as: davidfranco2300 (davidfranco2300-other) to https://api.wandb.ai. Use `wandb login --relogin` to force relogin
+wandb: Tracking run with wandb version 0.21.4
+wandb: Run data is saved locally in /workspace/testing_dense/wandb/run-20250917_161337-n9dmr5eq
+wandb: Run `wandb offline` to turn off syncing.
+wandb: Syncing run neat-sky-8
+wandb: ⭐️ View project at https://wandb.ai/davidfranco2300-other/moe-bf16-experiments_v2
+wandb: 🚀 View run at https://wandb.ai/davidfranco2300-other/moe-bf16-experiments_v2/runs/n9dmr5eq
+Resolving data files: 100%|███████████████████████████████████████████████████████| 2410/2410 [00:00<00:00, 7528.14it/s]
+iter     20 | loss 10.6008 | lr 3.150e-06 | 77154 tok/s | r_max 0.16 act_min 8 col 0
+iter     40 | loss 10.5822 | lr 6.150e-06 | 82154 tok/s | r_max 0.18 act_min 8 col 0
+iter     60 | loss 10.5143 | lr 9.150e-06 | 82352 tok/s | r_max 0.17 act_min 8 col 0
+iter     80 | loss 10.4119 | lr 1.215e-05 | 81744 tok/s | r_max 0.16 act_min 8 col 0
+iter    100 | loss 10.2737 | lr 1.515e-05 | 80947 tok/s | r_max 0.17 act_min 8 col 0
+iter    120 | loss 9.9865 | lr 1.815e-05 | 81941 tok/s | r_max 0.17 act_min 8 col 0
+iter    140 | loss 9.6744 | lr 2.115e-05 | 82984 tok/s | r_max 0.18 act_min 8 col 0
+iter    160 | loss 9.3559 | lr 2.415e-05 | 82793 tok/s | r_max 0.19 act_min 8 col 0
+iter    180 | loss 9.0216 | lr 2.715e-05 | 82756 tok/s | r_max 0.20 act_min 8 col 0
+iter    200 | loss 8.7454 | lr 3.015e-05 | 81286 tok/s | r_max 0.19 act_min 8 col 0
+eval | val_loss 8.7386
+iter    220 | loss 8.2175 | lr 3.315e-05 | 77393 tok/s | r_max 0.18 act_min 8 col 0
+iter    240 | loss 7.8458 | lr 3.615e-05 | 82411 tok/s | r_max 0.19 act_min 8 col 0
+iter    260 | loss 7.5576 | lr 3.915e-05 | 82167 tok/s | r_max 0.21 act_min 8 col 0
+iter    280 | loss 7.2938 | lr 4.215e-05 | 81444 tok/s | r_max 0.22 act_min 8 col 0
+iter    300 | loss 7.0860 | lr 4.515e-05 | 82690 tok/s | r_max 0.22 act_min 8 col 0
+iter    320 | loss 6.9692 | lr 4.815e-05 | 82277 tok/s | r_max 0.20 act_min 8 col 0
+iter    340 | loss 6.7872 | lr 5.115e-05 | 82185 tok/s | r_max 0.19 act_min 8 col 0
+iter    360 | loss 6.6896 | lr 5.415e-05 | 82817 tok/s | r_max 0.18 act_min 8 col 0
+iter    380 | loss 6.5048 | lr 5.715e-05 | 81297 tok/s | r_max 0.16 act_min 8 col 0
+iter    400 | loss 6.3674 | lr 6.015e-05 | 82586 tok/s | r_max 0.16 act_min 8 col 0
+eval | val_loss 6.3619
+iter    420 | loss 6.2578 | lr 6.315e-05 | 77821 tok/s | r_max 0.16 act_min 8 col 0
+iter    440 | loss 6.0900 | lr 6.615e-05 | 82761 tok/s | r_max 0.15 act_min 8 col 0
+iter    460 | loss 6.0383 | lr 6.915e-05 | 82767 tok/s | r_max 0.16 act_min 8 col 0
+iter    480 | loss 5.9089 | lr 7.215e-05 | 81759 tok/s | r_max 0.15 act_min 8 col 0
+iter    500 | loss 5.8857 | lr 7.515e-05 | 83090 tok/s | r_max 0.16 act_min 8 col 0
+iter    520 | loss 5.8606 | lr 7.815e-05 | 82054 tok/s | r_max 0.18 act_min 8 col 0
+iter    540 | loss 5.7870 | lr 8.115e-05 | 83023 tok/s | r_max 0.17 act_min 8 col 0
+iter    560 | loss 5.7229 | lr 8.415e-05 | 82800 tok/s | r_max 0.17 act_min 8 col 0
+iter    580 | loss 5.6452 | lr 8.715e-05 | 81690 tok/s | r_max 0.18 act_min 8 col 0
+iter    600 | loss 5.5309 | lr 9.015e-05 | 82689 tok/s | r_max 0.19 act_min 8 col 0
+eval | val_loss 5.5051
+iter    620 | loss 5.5293 | lr 9.315e-05 | 77575 tok/s | r_max 0.18 act_min 8 col 0
+iter    640 | loss 5.3708 | lr 9.615e-05 | 82863 tok/s | r_max 0.20 act_min 8 col 0
+iter    660 | loss 5.4073 | lr 9.915e-05 | 82785 tok/s | r_max 0.20 act_min 8 col 0
+iter    680 | loss 5.3128 | lr 1.021e-04 | 81126 tok/s | r_max 0.19 act_min 8 col 0
+iter    700 | loss 5.2661 | lr 1.051e-04 | 82621 tok/s | r_max 0.21 act_min 8 col 0
+iter    720 | loss 5.2517 | lr 1.081e-04 | 82925 tok/s | r_max 0.22 act_min 8 col 0
+iter    740 | loss 5.1910 | lr 1.111e-04 | 82275 tok/s | r_max 0.26 act_min 8 col 0
+iter    760 | loss 5.2107 | lr 1.141e-04 | 80689 tok/s | r_max 0.19 act_min 8 col 0
+iter    780 | loss 5.0518 | lr 1.171e-04 | 82746 tok/s | r_max 0.21 act_min 8 col 0
+iter    800 | loss 5.0800 | lr 1.201e-04 | 82580 tok/s | r_max 0.22 act_min 8 col 0
+eval | val_loss 4.9537
+iter    820 | loss 5.0149 | lr 1.231e-04 | 77993 tok/s | r_max 0.20 act_min 8 col 0
+iter    840 | loss 4.9895 | lr 1.261e-04 | 82760 tok/s | r_max 0.20 act_min 8 col 0
+iter    860 | loss 5.0388 | lr 1.291e-04 | 81367 tok/s | r_max 0.23 act_min 8 col 0
+iter    880 | loss 4.9285 | lr 1.321e-04 | 82412 tok/s | r_max 0.22 act_min 8 col 0
+iter    900 | loss 4.9009 | lr 1.352e-04 | 82825 tok/s | r_max 0.28 act_min 8 col 0
+iter    920 | loss 4.8467 | lr 1.381e-04 | 82409 tok/s | r_max 0.26 act_min 8 col 0
+iter    940 | loss 4.8412 | lr 1.411e-04 | 82289 tok/s | r_max 0.27 act_min 8 col 0
+iter    960 | loss 4.8114 | lr 1.442e-04 | 80651 tok/s | r_max 0.25 act_min 8 col 0
+iter    980 | loss 4.6931 | lr 1.471e-04 | 82201 tok/s | r_max 0.25 act_min 8 col 0
+iter   1000 | loss 4.7359 | lr 1.501e-04 | 83305 tok/s | r_max 0.26 act_min 8 col 0
+eval | val_loss 4.6267
+iter   1020 | loss 4.6994 | lr 1.531e-04 | 77031 tok/s | r_max 0.24 act_min 8 col 0
+iter   1040 | loss 4.7930 | lr 1.561e-04 | 82439 tok/s | r_max 0.23 act_min 8 col 0
+iter   1060 | loss 4.4942 | lr 1.591e-04 | 80827 tok/s | r_max 0.23 act_min 8 col 0
+iter   1080 | loss 4.5923 | lr 1.621e-04 | 82575 tok/s | r_max 0.22 act_min 8 col 0
+iter   1100 | loss 4.6684 | lr 1.652e-04 | 82850 tok/s | r_max 0.26 act_min 8 col 0
+iter   1120 | loss 4.5733 | lr 1.681e-04 | 81748 tok/s | r_max 0.29 act_min 8 col 0
+iter   1140 | loss 4.4835 | lr 1.711e-04 | 81012 tok/s | r_max 0.26 act_min 8 col 0
+iter   1160 | loss 4.6147 | lr 1.741e-04 | 82326 tok/s | r_max 0.22 act_min 8 col 0
+iter   1180 | loss 4.5002 | lr 1.771e-04 | 82577 tok/s | r_max 0.27 act_min 8 col 0
+iter   1200 | loss 4.5042 | lr 1.801e-04 | 82300 tok/s | r_max 0.25 act_min 8 col 0
+eval | val_loss 4.3896
+iter   1220 | loss 4.5157 | lr 1.831e-04 | 77292 tok/s | r_max 0.22 act_min 8 col 0
+iter   1240 | loss 4.4554 | lr 1.861e-04 | 80559 tok/s | r_max 0.28 act_min 8 col 0
+iter   1260 | loss 4.4411 | lr 1.891e-04 | 82965 tok/s | r_max 0.25 act_min 8 col 0
+iter   1280 | loss 4.4618 | lr 1.921e-04 | 81716 tok/s | r_max 0.26 act_min 8 col 0
+iter   1300 | loss 4.4209 | lr 1.952e-04 | 82683 tok/s | r_max 0.26 act_min 8 col 0
+iter   1320 | loss 4.3999 | lr 1.981e-04 | 82274 tok/s | r_max 0.27 act_min 8 col 0
+iter   1340 | loss 4.3366 | lr 2.011e-04 | 82141 tok/s | r_max 0.25 act_min 8 col 0
+iter   1360 | loss 4.3724 | lr 2.041e-04 | 82600 tok/s | r_max 0.25 act_min 8 col 0
+iter   1380 | loss 4.3805 | lr 2.071e-04 | 82909 tok/s | r_max 0.25 act_min 8 col 0
+iter   1400 | loss 4.3524 | lr 2.101e-04 | 82604 tok/s | r_max 0.24 act_min 8 col 0
+eval | val_loss 4.1990
+iter   1420 | loss 4.2645 | lr 2.131e-04 | 77361 tok/s | r_max 0.28 act_min 8 col 0
+iter   1440 | loss 4.2707 | lr 2.161e-04 | 81545 tok/s | r_max 0.26 act_min 8 col 0
+iter   1460 | loss 4.2221 | lr 2.191e-04 | 82125 tok/s | r_max 0.27 act_min 8 col 0
+iter   1480 | loss 4.3194 | lr 2.221e-04 | 82443 tok/s | r_max 0.27 act_min 8 col 0
+iter   1500 | loss 4.2171 | lr 2.251e-04 | 81873 tok/s | r_max 0.25 act_min 8 col 0
+iter   1520 | loss 4.1992 | lr 2.281e-04 | 80927 tok/s | r_max 0.25 act_min 8 col 0
+iter   1540 | loss 4.2949 | lr 2.311e-04 | 82281 tok/s | r_max 0.28 act_min 8 col 0
+iter   1560 | loss 4.1975 | lr 2.341e-04 | 82136 tok/s | r_max 0.25 act_min 8 col 0
+iter   1580 | loss 4.2299 | lr 2.371e-04 | 82271 tok/s | r_max 0.30 act_min 8 col 0
+iter   1600 | loss 4.1753 | lr 2.401e-04 | 82319 tok/s | r_max 0.21 act_min 8 col 0
+eval | val_loss 4.0625
+iter   1620 | loss 4.1839 | lr 2.431e-04 | 76274 tok/s | r_max 0.26 act_min 8 col 0
+iter   1640 | loss 4.2026 | lr 2.461e-04 | 81881 tok/s | r_max 0.24 act_min 8 col 0
+iter   1660 | loss 4.1830 | lr 2.491e-04 | 82401 tok/s | r_max 0.26 act_min 8 col 0
+iter   1680 | loss 4.2155 | lr 2.521e-04 | 82309 tok/s | r_max 0.28 act_min 8 col 0
+iter   1700 | loss 4.1569 | lr 2.551e-04 | 82146 tok/s | r_max 0.29 act_min 8 col 0
+iter   1720 | loss 4.0801 | lr 2.582e-04 | 81983 tok/s | r_max 0.28 act_min 8 col 0
+iter   1740 | loss 4.1342 | lr 2.611e-04 | 82677 tok/s | r_max 0.27 act_min 8 col 0
+iter   1760 | loss 4.0314 | lr 2.641e-04 | 82327 tok/s | r_max 0.25 act_min 8 col 0
+iter   1780 | loss 4.0902 | lr 2.672e-04 | 82207 tok/s | r_max 0.26 act_min 8 col 0
+iter   1800 | loss 4.0889 | lr 2.701e-04 | 83259 tok/s | r_max 0.30 act_min 8 col 0
+eval | val_loss 3.9582
+iter   1820 | loss 3.9305 | lr 2.731e-04 | 77020 tok/s | r_max 0.30 act_min 8 col 0
+iter   1840 | loss 4.1403 | lr 2.761e-04 | 81441 tok/s | r_max 0.25 act_min 8 col 0
+iter   1860 | loss 4.1151 | lr 2.791e-04 | 81685 tok/s | r_max 0.30 act_min 8 col 0
+iter   1880 | loss 4.0210 | lr 2.821e-04 | 82265 tok/s | r_max 0.31 act_min 8 col 0
+iter   1900 | loss 4.0901 | lr 2.851e-04 | 81223 tok/s | r_max 0.21 act_min 8 col 0
+iter   1920 | loss 4.0563 | lr 2.881e-04 | 82360 tok/s | r_max 0.27 act_min 8 col 0
+iter   1940 | loss 4.0599 | lr 2.911e-04 | 81881 tok/s | r_max 0.26 act_min 8 col 0
+iter   1960 | loss 4.0082 | lr 2.941e-04 | 82361 tok/s | r_max 0.30 act_min 8 col 0
+iter   1980 | loss 4.0254 | lr 2.971e-04 | 82088 tok/s | r_max 0.24 act_min 8 col 0
+iter   2000 | loss 4.0689 | lr 3.000e-04 | 80869 tok/s | r_max 0.28 act_min 8 col 0
+eval | val_loss 3.8795
+iter   2020 | loss 4.0290 | lr 3.000e-04 | 76871 tok/s | r_max 0.32 act_min 8 col 0
+iter   2040 | loss 3.9535 | lr 3.000e-04 | 82706 tok/s | r_max 0.30 act_min 8 col 0
+iter   2060 | loss 3.9188 | lr 2.999e-04 | 82207 tok/s | r_max 0.34 act_min 8 col 0
+iter   2080 | loss 3.9660 | lr 2.999e-04 | 82831 tok/s | r_max 0.24 act_min 8 col 0
+iter   2100 | loss 3.9953 | lr 2.998e-04 | 81381 tok/s | r_max 0.22 act_min 8 col 0
+iter   2120 | loss 3.9679 | lr 2.997e-04 | 82802 tok/s | r_max 0.28 act_min 8 col 0
+iter   2140 | loss 3.9593 | lr 2.996e-04 | 82276 tok/s | r_max 0.24 act_min 8 col 0
+iter   2160 | loss 3.9930 | lr 2.995e-04 | 82469 tok/s | r_max 0.29 act_min 8 col 0
+iter   2180 | loss 3.9888 | lr 2.994e-04 | 82370 tok/s | r_max 0.27 act_min 8 col 0
+iter   2200 | loss 3.9387 | lr 2.993e-04 | 80813 tok/s | r_max 0.28 act_min 8 col 0
+eval | val_loss 3.8117
+iter   2220 | loss 4.0041 | lr 2.991e-04 | 76812 tok/s | r_max 0.27 act_min 8 col 0
+iter   2240 | loss 3.9442 | lr 2.989e-04 | 81600 tok/s | r_max 0.33 act_min 8 col 0
+iter   2260 | loss 3.8991 | lr 2.988e-04 | 81994 tok/s | r_max 0.29 act_min 8 col 0
+iter   2280 | loss 3.9760 | lr 2.986e-04 | 81231 tok/s | r_max 0.28 act_min 8 col 0
+iter   2300 | loss 4.1271 | lr 2.983e-04 | 82254 tok/s | r_max 0.30 act_min 8 col 0
+iter   2320 | loss 3.8980 | lr 2.981e-04 | 82482 tok/s | r_max 0.28 act_min 8 col 0
+iter   2340 | loss 3.9738 | lr 2.979e-04 | 83204 tok/s | r_max 0.33 act_min 8 col 0
+iter   2360 | loss 3.8969 | lr 2.976e-04 | 82075 tok/s | r_max 0.28 act_min 8 col 0
+iter   2380 | loss 3.9222 | lr 2.973e-04 | 80525 tok/s | r_max 0.19 act_min 8 col 0
+iter   2400 | loss 3.8842 | lr 2.970e-04 | 82891 tok/s | r_max 0.25 act_min 8 col 0
+eval | val_loss 3.7640
+iter   2420 | loss 3.8498 | lr 2.967e-04 | 77157 tok/s | r_max 0.30 act_min 8 col 0
+iter   2440 | loss 3.7504 | lr 2.964e-04 | 82321 tok/s | r_max 0.31 act_min 8 col 0
+iter   2460 | loss 4.0036 | lr 2.961e-04 | 82627 tok/s | r_max 0.30 act_min 8 col 0
+iter   2480 | loss 3.9195 | lr 2.958e-04 | 81230 tok/s | r_max 0.28 act_min 8 col 0
+iter   2500 | loss 3.9551 | lr 2.954e-04 | 82597 tok/s | r_max 0.34 act_min 8 col 0

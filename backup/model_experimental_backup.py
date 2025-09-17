@@ -230,27 +230,13 @@ class MoE(nn.Module):
             ExpertSwiGLU(d_model, bias=bias, dropout=dropout) for _ in range(n_experts)
         ])
         self.dropout = nn.Dropout(dropout)
-        # compiled expert-apply (lazy)
-        self._compiled_apply = None
 
         # Fast path when n_experts=1 -> just dense SwiGLU
         self._dense_fallback = (n_experts == 1)
         if self._dense_fallback:
             self.dense = ExpertSwiGLU(d_model, bias=bias, dropout=dropout)
 
-    def _apply_experts_dropless(self, x_flat: torch.Tensor, top1_idx: torch.Tensor, top1_p: torch.Tensor) -> torch.Tensor:
-        # Expert application with top-1 weighting; compiled variant (dynamic=True)
-        y_flat = torch.zeros_like(x_flat)
-        for e in range(self.n_experts):
-            mask = (top1_idx == e)
-            if mask.any():
-                xe = x_flat[mask]
-                ye = self.experts[e](xe)
-                ye = ye * top1_p[mask].unsqueeze(-1)
-                y_flat[mask] = ye
-        return y_flat
-
-    @_dynamo_disable  # keep routing eager; call into compiled expert compute
+    @_dynamo_disable  # avoid torch.compile capturing highly dynamic routing code
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         b, t, d = x.shape
         if self._dense_fallback:
@@ -262,19 +248,15 @@ class MoE(nn.Module):
 
         if self.router.dropless:
             # Dropless: process all tokens by their chosen expert and scatter back
-            # lazy-compile expert application once
-            if self._compiled_apply is None:
-                try:
-                    self._compiled_apply = torch.compile(
-                        self._apply_experts_dropless,
-                        backend="inductor",
-                        dynamic=True,
-                        fullgraph=False,
-                        mode="reduce-overhead",
-                    )
-                except Exception:
-                    self._compiled_apply = self._apply_experts_dropless  # fallback
-            y_flat = self._compiled_apply(x_flat, top1_idx, top1_p)
+            y_flat = torch.zeros_like(x_flat)
+            for e in range(self.n_experts):
+                mask = (top1_idx == e)
+                if mask.any():
+                    xe = x_flat[mask]
+                    ye = self.experts[e](xe)
+                    # Scale by gate probability (Switch-style top-1 weighting)
+                    ye = ye * top1_p[mask].unsqueeze(-1)
+                    y_flat[mask] = ye
             y = y_flat.reshape(b, t, d)
             # Stats (no drops in dropless)
             with torch.no_grad():
@@ -554,8 +536,7 @@ class TransformerBlock(nn.Module):
                  n_experts: int, capacity_factor: float, dropless: bool,
                  load_balance_alpha: float, router_z_loss_coef: float,
                  attn_gate: str = 'none', use_rope: bool = True,
-                 qk_norm: bool = False, qk_norm_eps: float = 1e-6,
-                 use_compile: bool = False):
+                 qk_norm: bool = False, qk_norm_eps: float = 1e-6):
         super().__init__()
         self.ln1 = RMSNorm(d_model)
         self.use_rope = use_rope
@@ -576,12 +557,6 @@ class TransformerBlock(nn.Module):
             router_temperature=1.0, router_noise_std=0.0, router_noise_type='gumbel',
             grouped=False,
         )
-        # compile attention submodule (shape-stable)
-        if use_compile:
-            try:
-                self.attn = torch.compile(self.attn, backend="inductor", dynamic=True, fullgraph=False, mode="reduce-overhead")
-            except Exception:
-                pass
 
     def forward(self, x: torch.Tensor, rope_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         attn_in = self.ln1(x)
@@ -616,7 +591,6 @@ class TinyMoETransformer(nn.Module):
                  moe_grouped: bool = False,
                  qk_norm: bool = False,
                  qk_norm_eps: float = 1e-6,
-                 compile_submodules: bool = False,
                  ):  # noqa: E501
         super().__init__()
         assert d_model % n_head == 0, "d_model must be divisible by n_head"
@@ -642,7 +616,6 @@ class TinyMoETransformer(nn.Module):
                 use_rope=use_rope,
                 qk_norm=qk_norm,
                 qk_norm_eps=qk_norm_eps,
-                use_compile=compile_submodules,
             )
             for _ in range(n_layer)
         ])
