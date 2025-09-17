@@ -388,3 +388,6 @@ iter   2440 | loss 3.7504 | lr 2.964e-04 | 82321 tok/s | r_max 0.31 act_min 8 co
 iter   2460 | loss 4.0036 | lr 2.961e-04 | 82627 tok/s | r_max 0.30 act_min 8 col 0
 iter   2480 | loss 3.9195 | lr 2.958e-04 | 81230 tok/s | r_max 0.28 act_min 8 col 0
 iter   2500 | loss 3.9551 | lr 2.954e-04 | 82597 tok/s | r_max 0.34 act_min 8 col 0
+
+
+python train_experimental.py --device cuda --dataset_name HuggingFaceFW/fineweb-edu --dataset_config sample-10BT --n_experts 8 --dropless --load_balance_alpha 0.12 --router_z_loss_coef 1e-3 --router_temp_init 2.2 --router_temp_final 1.3 --router_temp_anneal_iters 5000 --router_noise_std_init 0.9 --router_noise_decay_iters 5000 --router_noise_type gumbel --attn_gate sigmoid_head --qk_norm --use_rope --batch_size 8 --gradient_accumulation_steps 12 --max_iters 8000 --lr_decay_iters 8000 --warmup_iters 1000 --eval_interval 200 --eval_iters 50 --wandb_project moe-bf16-experiments_v2 --optimizer adamw --log_interval 20 --compile --learning_rate 6e-4 --n_layer 16

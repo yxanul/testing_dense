@@ -85,6 +85,7 @@ class TrainConfig:
     grad_clip: float = 1.0
     compile: bool = False
     seed: int = 1337
+    fp8: bool = False
 
     # Data
     dataset_name: str = 'HuggingFaceFW/fineweb-edu'
@@ -406,6 +407,7 @@ def train(cfg: TrainConfig):
         qk_norm=cfg.qk_norm,
         qk_norm_eps=cfg.qk_norm_eps,
         compile_submodules=bool(cfg.compile),
+        fp8=bool(cfg.fp8),
     ).to(device=device, dtype=torch.bfloat16)
 
     total_params = model.num_parameters()
@@ -697,6 +699,7 @@ def main():
     p.add_argument('--grad_clip', type=float, default=1.0)
     p.add_argument('--compile', action='store_true')
     p.add_argument('--seed', type=int, default=1337)
+    p.add_argument('--fp8', action='store_true')
 
     # Data
     p.add_argument('--dataset_name', type=str, default='HuggingFaceFW/fineweb-edu')

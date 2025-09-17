@@ -39,6 +39,136 @@ except Exception:
     def _dynamo_disable(fn):
         return fn
 
+# ----------------------- Optional FP8 helpers -----------------------
+
+_FP8_AVAILABLE = hasattr(torch, 'float8_e4m3fn') and hasattr(torch, '_scaled_mm')
+
+if _FP8_AVAILABLE:
+    from torch import Tensor
+
+    try:
+        import torch.library as _lib
+    except Exception:
+        _lib = None  # pragma: no cover
+
+    if _lib is not None:
+        @_lib.custom_op("nanogpt::mm", mutates_args=())  # type: ignore
+        def _fp8_mm_op(x: Tensor, w: Tensor, x_s: float, w_s: float, grad_s: float):
+            @torch.compile
+            def impl(x: Tensor, w: Tensor):
+                assert x.is_contiguous() and w.is_contiguous()
+                x_f8 = x.div(x_s).to(torch.float8_e4m3fn)
+                w_f8 = w.div(w_s).to(torch.float8_e4m3fn)
+                out = torch._scaled_mm(
+                    x_f8,
+                    w_f8.T,
+                    out_dtype=torch.bfloat16,
+                    scale_a=x.new_tensor(x_s, dtype=torch.float32),
+                    scale_b=x.new_tensor(w_s, dtype=torch.float32),
+                    use_fast_accum=True,
+                )
+                return out, x_f8, w_f8
+
+            return impl(x, w)
+
+        @_fp8_mm_op.register_fake  # type: ignore
+        def _(x: Tensor, w: Tensor, *_):
+            assert x.ndim == 2 and w.ndim == 2 and x.shape[1] == w.shape[1]
+            assert x.device == w.device
+            assert x.is_contiguous() and w.is_contiguous()
+            return x @ w.T, x.to(torch.float8_e4m3fn), w.to(torch.float8_e4m3fn)
+
+        @_lib.custom_op("nanogpt::mm_backward", mutates_args=())  # type: ignore
+        def _fp8_mm_backward_op(g: Tensor, x_f8: Tensor, w_f8: Tensor, x_s: float, w_s: float, grad_s: float):
+            @torch.compile
+            def impl(grad: Tensor, x_f8: Tensor, w_f8: Tensor):
+                assert grad.is_contiguous()
+                x_inv_s = grad.new_tensor(x_s, dtype=torch.float32)
+                w_inv_s = grad.new_tensor(w_s, dtype=torch.float32)
+                grad_inv_s = grad.new_tensor(grad_s, dtype=torch.float32)
+                grad_f8 = grad.div(grad_s).to(torch.float8_e5m2)
+                grad_x = torch._scaled_mm(
+                    grad_f8,
+                    w_f8.T.contiguous().T,
+                    out_dtype=torch.bfloat16,
+                    scale_a=grad_inv_s,
+                    scale_b=w_inv_s,
+                    use_fast_accum=False,
+                )
+                grad_w = torch._scaled_mm(
+                    x_f8.T.contiguous(),
+                    grad_f8.T.contiguous().T,
+                    out_dtype=torch.float32,
+                    scale_a=x_inv_s,
+                    scale_b=grad_inv_s,
+                    use_fast_accum=False,
+                ).T
+                return grad_x, grad_w
+
+            return impl(g, x_f8, w_f8)
+
+        @_fp8_mm_backward_op.register_fake  # type: ignore
+        def _(g: Tensor, x_f8: Tensor, w_f8: Tensor, *_):
+            return x_f8.to(torch.bfloat16), w_f8.T.contiguous().T.to(torch.float32)
+
+        def _fp8_mm_backward(ctx, grad_out: Tensor, *_):
+            x_f8, w_f8 = ctx.saved_tensors
+            x_s, w_s, grad_s = ctx.scales
+            grad_x, grad_w = torch.ops.nanogpt.mm_backward(  # type: ignore
+                grad_out.contiguous(), x_f8, w_f8, x_s, w_s, grad_s
+            )
+            return grad_x, grad_w, None, None, None
+
+        def _fp8_mm_setup(ctx: torch.autograd.function.FunctionCtx, inputs, output):
+            *_, x_s, w_s, grad_s = inputs
+            _, x_f8, w_f8 = output
+            ctx.save_for_backward(x_f8, w_f8)
+            ctx.scales = x_s, w_s, grad_s
+            ctx.set_materialize_grads(False)
+
+        _fp8_mm_op.register_autograd(_fp8_mm_backward, setup_context=_fp8_mm_setup)  # type: ignore
+
+
+class FP8Linear(nn.Module):
+    """Minimal FP8 Linear: FP8 matmul with BF16 master weights/accum.
+
+    Falls back to nn.Linear if FP8 is not available.
+    """
+    def __init__(self, in_features: int, out_features: int, bias: bool = True):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(out_features, in_features, dtype=torch.bfloat16))
+        self.bias = nn.Parameter(torch.zeros(out_features, dtype=torch.bfloat16)) if bias else None
+        # simple per-tensor scales
+        self.register_buffer('x_scale', torch.tensor(1.0, dtype=torch.float32))
+        self.register_buffer('w_scale', torch.tensor(1.0, dtype=torch.float32))
+        self.register_buffer('g_scale', torch.tensor(1.0, dtype=torch.float32))
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        if self.bias is not None:
+            fan_in = in_features
+            bound = 1 / math.sqrt(fan_in)
+            nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not _FP8_AVAILABLE or not x.is_cuda:
+            y = torch.matmul(x, self.weight.T)
+            if self.bias is not None:
+                y = y + self.bias
+            return y
+        # update scales (naive amax-to-scale)
+        xs = float(x.detach().abs().amax().clamp_min(1e-6))
+        ws = float(self.weight.detach().abs().amax().clamp_min(1e-6))
+        gs = float(self.g_scale.item())  # keep previous grad scale
+        self.x_scale.fill_(xs)
+        self.w_scale.fill_(ws)
+        # custom op does FP8 -> BF16 matmul
+        y, x_f8, w_f8 = torch.ops.nanogpt.mm(  # type: ignore
+            x.contiguous(), self.weight.contiguous(), xs, ws, gs
+        )
+        if self.bias is not None:
+            y = y + self.bias
+        return y
+
+
 
 TOKENIZER_NAME = "mistralai/Mistral-7B-v0.3"
 tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME, use_fast=True)
@@ -111,14 +241,15 @@ class ExpertSwiGLU(nn.Module):
 
     in_features -> hidden (8/3 * d) using two projections for SwiGLU, then down to in_features.
     """
-    def __init__(self, d_model: int, bias: bool = False, dropout: float = 0.0):
+    def __init__(self, d_model: int, bias: bool = False, dropout: float = 0.0, use_fp8: bool = False):
+        self.use_fp8 = bool(use_fp8) and _FP8_AVAILABLE
         super().__init__()
         hidden = int(round(d_model * (8.0 / 3.0)))
         # round to multiples of 64 for better kernels
         hidden = (hidden + 63) // 64 * 64
-        self.up_u = nn.Linear(d_model, hidden, bias=bias)
-        self.up_v = nn.Linear(d_model, hidden, bias=bias)
-        self.down = nn.Linear(hidden, d_model, bias=bias)
+        self.up_u = FP8Linear(d_model, hidden, bias=bias) if self.use_fp8 else nn.Linear(d_model, hidden, bias=bias)
+        self.up_v = FP8Linear(d_model, hidden, bias=bias) if self.use_fp8 else nn.Linear(d_model, hidden, bias=bias)
+        self.down = FP8Linear(hidden, d_model, bias=bias) if self.use_fp8 else nn.Linear(hidden, d_model, bias=bias)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -636,7 +767,7 @@ class TransformerBlock(nn.Module):
                  load_balance_alpha: float, router_z_loss_coef: float,
                  attn_gate: str = 'none', use_rope: bool = True,
                  qk_norm: bool = False, qk_norm_eps: float = 1e-6,
-                 use_compile: bool = False):
+                 use_compile: bool = False, use_fp8: bool = False):
         super().__init__()
         self.ln1 = RMSNorm(d_model)
         self.use_rope = use_rope
@@ -645,10 +776,10 @@ class TransformerBlock(nn.Module):
         # Always use GQA variants. When n_kv_heads == n_head, this reduces to standard MHA.
         if attn_gate == 'sigmoid_head':
             self.attn = GatedGQA(d_model, n_head, n_kv_heads, bias=bias, dropout=dropout,
-                                 qk_norm=qk_norm, qk_norm_eps=qk_norm_eps)
+                                 qk_norm=qk_norm, qk_norm_eps=qk_norm_eps, use_fp8=use_fp8)
         else:
             self.attn = GQA(d_model, n_head, n_kv_heads, bias=bias, dropout=dropout,
-                            qk_norm=qk_norm, qk_norm_eps=qk_norm_eps)
+                            qk_norm=qk_norm, qk_norm_eps=qk_norm_eps, use_fp8=use_fp8)
         self.ln2 = RMSNorm(d_model)
         self.moe = MoE(
             d_model, n_experts, bias=bias, dropout=dropout,
@@ -698,6 +829,7 @@ class TinyMoETransformer(nn.Module):
                  qk_norm: bool = False,
                  qk_norm_eps: float = 1e-6,
                  compile_submodules: bool = False,
+                 fp8: bool = False,
                  ):  # noqa: E501
         super().__init__()
         assert d_model % n_head == 0, "d_model must be divisible by n_head"
@@ -724,6 +856,7 @@ class TinyMoETransformer(nn.Module):
                 qk_norm=qk_norm,
                 qk_norm_eps=qk_norm_eps,
                 use_compile=compile_submodules,
+                use_fp8=fp8,
             )
             for _ in range(n_layer)
         ])
