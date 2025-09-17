@@ -295,6 +295,9 @@ class _MuonSophia:
         from sophia import SophiaG
         self.muon = SingleDeviceMuon(hidden, **muon_kw)
         self.sophia = SophiaG(aux, **sophia_kw)
+        # mark groups to allow per-optimizer LR scheduling
+        for _g in self.muon.param_groups: _g['kind'] = 'muon'
+        for _g in self.sophia.param_groups: _g['kind'] = 'sophia'
         # expose combined param groups so schedulers can update lr, wd, etc.
         self.param_groups = list(self.muon.param_groups) + list(self.sophia.param_groups)
 
@@ -441,8 +444,24 @@ def train(cfg: TrainConfig):
         # LR schedule
         lr = cosine_lr(it, cfg.learning_rate, cfg.min_lr, cfg.warmup_iters, cfg.lr_decay_iters)
         if hasattr(optimizer, 'param_groups'):
-            for pg in optimizer.param_groups:
-                pg['lr'] = lr
+            if sophia_meta is not None:
+                # derive per-optimizer min_lrs by keeping the same min/base ratio
+                ratio = (cfg.min_lr / max(1e-12, cfg.learning_rate))
+                muon_lr_sched = cosine_lr(it, cfg.muon_lr, cfg.muon_lr * ratio, cfg.warmup_iters, cfg.lr_decay_iters)
+                sophia_lr_sched = cosine_lr(it, cfg.sophia_lr, cfg.sophia_lr * ratio, cfg.warmup_iters, cfg.lr_decay_iters)
+                # if groups are annotated, set per kind; else assume sophia-only
+                any_kind = any(isinstance(g, dict) and ('kind' in g) for g in optimizer.param_groups)
+                for pg in optimizer.param_groups:
+                    if any_kind:
+                        if pg.get('kind') == 'muon':
+                            pg['lr'] = muon_lr_sched
+                        else:
+                            pg['lr'] = sophia_lr_sched
+                    else:
+                        pg['lr'] = sophia_lr_sched
+            else:
+                for pg in optimizer.param_groups:
+                    pg['lr'] = lr
 
         # Router dynamics schedule per-step
         curr_temp = _anneal_linear(it, cfg.router_temp_init, cfg.router_temp_final, cfg.router_temp_anneal_iters)
@@ -534,6 +553,15 @@ def train(cfg: TrainConfig):
                 'grad/clipped_cum': int(clip_cum),
                 'train/tokens_b': tokens_cum / 1e9,
             }
+            if sophia_meta is not None and hasattr(optimizer, 'param_groups'):
+                try:
+                    mu_lr = next((pg['lr'] for pg in optimizer.param_groups if pg.get('kind')=='muon'), None)
+                    so_lr = next((pg['lr'] for pg in optimizer.param_groups if pg.get('kind')=='sophia'), None)
+                    if mu_lr is not None: metrics['opt/lr_muon'] = float(mu_lr)
+                    if so_lr is not None: metrics['opt/lr_sophia'] = float(so_lr)
+                except Exception:
+                    pass
+
             if last_router_metrics:
                 metrics.update(last_router_metrics)
 
