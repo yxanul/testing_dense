@@ -53,7 +53,7 @@ if _FP8_AVAILABLE:
 
     if _lib is not None:
         @_lib.custom_op("nanogpt::mm", mutates_args=())  # type: ignore
-        def _fp8_mm_op(x: Tensor, w: Tensor, x_s: float, w_s: float, grad_s: float):
+        def _fp8_mm_op(x: Tensor, w: Tensor, x_s: float, w_s: float, grad_s: float) -> Tuple[Tensor, Tensor, Tensor]:
             @torch.compile
             def impl(x: Tensor, w: Tensor):
                 assert x.is_contiguous() and w.is_contiguous()
@@ -79,7 +79,7 @@ if _FP8_AVAILABLE:
             return x @ w.T, x.to(torch.float8_e4m3fn), w.to(torch.float8_e4m3fn)
 
         @_lib.custom_op("nanogpt::mm_backward", mutates_args=())  # type: ignore
-        def _fp8_mm_backward_op(g: Tensor, x_f8: Tensor, w_f8: Tensor, x_s: float, w_s: float, grad_s: float):
+        def _fp8_mm_backward_op(g: Tensor, x_f8: Tensor, w_f8: Tensor, x_s: float, w_s: float, grad_s: float) -> Tuple[Tensor, Tensor]:
             @torch.compile
             def impl(grad: Tensor, x_f8: Tensor, w_f8: Tensor):
                 assert grad.is_contiguous()
