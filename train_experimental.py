@@ -421,6 +421,10 @@ def train(cfg: TrainConfig):
                 inductor_config.triton.cudagraphs = False
             if hasattr(inductor_config, 'shape_padding'):
                 inductor_config.shape_padding = True
+            if hasattr(inductor_config.triton, 'cudagraph_skip_dynamic_graphs'):
+                inductor_config.triton.cudagraph_skip_dynamic_graphs = True
+            if hasattr(inductor_config.triton, 'cudagraph_dynamic_shape_warn_limit'):
+                inductor_config.triton.cudagraph_dynamic_shape_warn_limit = None
         except Exception:
             pass
         # warmup pass to seed dynamic guards

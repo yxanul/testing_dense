@@ -246,6 +246,9 @@ class MoE(nn.Module):
             if mask.any():
                 xe = x_flat[mask]
                 ye = self.experts[e](xe)
+                # ensure dtype matches destination to avoid index_put dtype mismatch under compile/autocast
+                if ye.dtype != x_flat.dtype:
+                    ye = ye.to(x_flat.dtype)
                 ye = ye * top1_p[mask].unsqueeze(-1)
                 y_flat[mask] = ye
         return y_flat
