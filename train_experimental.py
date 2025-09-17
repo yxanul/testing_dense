@@ -491,7 +491,7 @@ def main():
     p.add_argument('--log_interval', type=int, default=10)
 
     # Logging
-    p.add_argument('--wandb_project', type=str, default='moe-bf16-experiments')
+    p.add_argument('--wandb_project', type=str, default='moe-bf16-experiments_v2')
     p.add_argument('--wandb_run_name', type=str, default=None)
 
     args = p.parse_args()
