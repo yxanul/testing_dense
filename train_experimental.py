@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 """
-Training script for TinyMoETransformer (BF16) split out from model_experimental.py.
+Training script for TinyMoETransformer (BF16) with HF streaming data and MoE router metrics.
 
-Expert Choice routing is removed; routing is top-1 token-choice only.
+Adds robust checkpointing:
+- Save 'last' every eval
+- Save 'best' when val improves
+- Optional periodic saves via --save_interval (e.g., 500,1000,...)
+- Resume from checkpoint (--resume or --auto_resume)
 """
 
-import itertools
 import math
 import time
+import itertools
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 
 import numpy as np
 import torch
@@ -19,9 +23,8 @@ from datasets import load_dataset
 
 try:
     from wandb_logger import WandBLogger
-except Exception:
-    # Fallback no-op logger
-    class WandBLogger:
+except Exception:  # pragma: no cover
+    class WandBLogger:  # type: ignore
         def __init__(self, *args, **kwargs): pass
         def watch(self, *args, **kwargs): pass
         def log_metrics(self, *args, **kwargs): pass
@@ -93,14 +96,29 @@ class TrainConfig:
     # IO
     checkpoint_dir: str = 'checkpoints_moe_bf16'
     log_interval: int = 10
+    save_interval: int = 0          # set >0 to save periodic checkpoints
+    keep_checkpoints: int = 3       # max periodic checkpoints to retain (0=keep all)
+    resume: Optional[str] = None    # path to checkpoint file or dir
+    auto_resume: bool = False       # auto-resume from last in checkpoint_dir
 
     # Logging
-    wandb_project: str = 'moe-bf16-experiments'
+    wandb_project: str = 'moe-bf16-experiments_v2'
     wandb_run_name: Optional[str] = None
+
+    # Optimizer
+    optimizer: str = 'adamw'        # 'adamw' | 'muon_sophia' | 'sophia'
+    muon_lr: float = 3e-2
+    muon_wd: float = 1e-2
+    sophia_lr: float = 1e-3
+    sophia_b1: float = 0.965
+    sophia_b2: float = 0.99
+    sophia_rho: float = 0.1
+    sophia_wd: float = 0.2
+    sophia_k: int = 10              # Hessian EMA update interval (steps)
 
 
 class HFStreamingBatcher:
-    """Stream Hugging Face dataset, tokenize, and expose train/eval batches."""
+    """Stream dataset, tokenize, and expose [x,y] batches for train/eval."""
     def __init__(self,
                  dataset_name: str,
                  dataset_config: str,
@@ -128,14 +146,14 @@ class HFStreamingBatcher:
         self._eval_index = 0
 
     def _new_stream(self, seed_offset: int):
-        ds = load_dataset(self.dataset_name, name=self.dataset_config, split="train", streaming=True)
+        ds = load_dataset(self.dataset_name, name=self.dataset_config, split='train', streaming=True)
         try:
             ds = ds.shuffle(seed=self.seed + seed_offset, buffer_size=self.shuffle_buffer)
         except Exception:
             pass
         return iter(ds)
 
-    def _tokenize_example(self, example):
+    def _tokenize_example(self, example) -> List[int]:
         text = ''
         if isinstance(example, dict):
             text = example.get(self.text_key) or ''
@@ -151,7 +169,7 @@ class HFStreamingBatcher:
 
     def _sequence_iter(self, seed_offset: int):
         stream = self._new_stream(seed_offset)
-        buffer = []
+        buffer: List[int] = []
         while True:
             try:
                 example = next(stream)
@@ -180,21 +198,19 @@ class HFStreamingBatcher:
         return chunk
 
     def get_batch(self, split: str, batch_size: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        if split == 'train':
-            chunks = [self._next_train_chunk() for _ in range(batch_size)]
-        else:
-            chunks = [self._next_eval_chunk() for _ in range(batch_size)]
+        chunks = [self._next_train_chunk() if split == 'train' else self._next_eval_chunk() for _ in range(batch_size)]
         x = torch.stack([c[:-1] for c in chunks]).to(self.device, non_blocking=True)
         y = torch.stack([c[1:] for c in chunks]).to(self.device, non_blocking=True)
         return x, y
+
 
 def cosine_lr(it: int, base_lr: float, min_lr: float, warmup: int, total: int) -> float:
     if it < warmup:
         return base_lr * (it + 1) / max(1, warmup)
     if it >= total:
         return min_lr
-    progress = (it - warmup) / max(1, total - warmup)
-    return min_lr + 0.5 * (base_lr - min_lr) * (1 + math.cos(math.pi * progress))
+    a = (it - warmup) / max(1, total - warmup)
+    return min_lr + 0.5 * (base_lr - min_lr) * (1 + math.cos(math.pi * a))
 
 
 def _anneal_linear(it: int, init_v: float, final_v: float, total: int) -> float:
@@ -212,10 +228,109 @@ def evaluate(model: TinyMoETransformer, data: HFStreamingBatcher, cfg: TrainConf
     with torch.no_grad():
         for _ in range(eval_iters):
             x, y = data.get_batch('val', cfg.batch_size)
-            logits, loss = model(x, y)
-            losses.append(loss.item())
+            _, loss = model(x, y)
+            losses.append(float(loss.item()))
     model.train()
     return float(sum(losses) / max(1, len(losses)))
+
+
+def _save_ckpt(path: Path, model: TinyMoETransformer, optimizer: torch.optim.Optimizer, cfg: TrainConfig, it: int, val_loss: Optional[float] = None):
+    payload = {
+        'model': model.state_dict(),
+        'optimizer': optimizer.state_dict(),
+        'cfg': asdict(cfg),
+        'iter': int(it),
+    }
+    if val_loss is not None:
+        payload['val_loss'] = float(val_loss)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(payload, path)
+
+
+def _maybe_resume(model: TinyMoETransformer, optimizer: torch.optim.Optimizer, cfg: TrainConfig) -> Tuple[int, float]:
+    start_iter = 0
+    best_val = float('inf')
+    ckpt: Optional[Path] = None
+    if cfg.resume:
+        p = Path(cfg.resume)
+        ckpt = p if p.is_file() else (p / 'last_moe_bf16.pt')
+    elif cfg.auto_resume:
+        cand = Path(cfg.checkpoint_dir) / 'last_moe_bf16.pt'
+        ckpt = cand if cand.exists() else None
+    if ckpt and ckpt.exists():
+        obj = torch.load(ckpt, map_location='cpu')
+        try:
+            model.load_state_dict(obj['model'], strict=False)
+        except Exception:
+            model.load_state_dict(obj['model'], strict=False)
+        if 'optimizer' in obj:
+            try:
+                optimizer.load_state_dict(obj['optimizer'])
+            except Exception:
+                pass
+        start_iter = int(obj.get('iter', 0))
+        best_val = float(obj.get('val_loss', float('inf')))
+        print(f"[resume] Loaded checkpoint from {ckpt} at iter={start_iter} best_val={best_val}")
+    return start_iter, best_val
+
+
+def _split_params_for_muon(model: torch.nn.Module):
+    hidden, aux = [], []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if ('wte' in name) or ('lm_head' in name):
+            aux.append(p)
+        elif p.ndim >= 2:
+            hidden.append(p)
+        else:
+            aux.append(p)
+    return hidden, aux
+
+
+class _MuonSophia:
+    """Muon on hidden params, SophiaG on aux params (single device)."""
+    def __init__(self, hidden, aux, muon_kw, sophia_kw):
+        from muon import SingleDeviceMuon
+        from sophia import SophiaG
+        self.muon = SingleDeviceMuon(hidden, **muon_kw)
+        self.sophia = SophiaG(aux, **sophia_kw)
+
+    def zero_grad(self, set_to_none=True):
+        self.muon.zero_grad(set_to_none=set_to_none)
+        self.sophia.zero_grad(set_to_none=set_to_none)
+
+    @torch.no_grad()
+    def step(self, bs: int):
+        self.muon.step()
+        self.sophia.step(bs=bs)
+
+    @torch.no_grad()
+    def update_hessian(self):
+        self.sophia.update_hessian()
+
+
+def _build_optimizer(cfg: TrainConfig, model: TinyMoETransformer):
+    kind = (cfg.optimizer or 'adamw').lower()
+    if kind in {'adamw', 'adam'}:
+        optim = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate, betas=(cfg.beta1, cfg.beta2), weight_decay=cfg.weight_decay)
+        sophia_meta = None
+        return optim, sophia_meta
+    if kind in {'muon_sophia', 'muon+sophia', 'ms'}:
+        hidden, aux = _split_params_for_muon(model)
+        opt = _MuonSophia(
+            hidden, aux,
+            muon_kw=dict(lr=cfg.muon_lr, weight_decay=cfg.muon_wd, momentum=0.95),
+            sophia_kw=dict(lr=cfg.sophia_lr, betas=(cfg.sophia_b1, cfg.sophia_b2), rho=cfg.sophia_rho, weight_decay=cfg.sophia_wd),
+        )
+        sophia_meta = {'k_hess': int(cfg.sophia_k)}
+        return opt, sophia_meta
+    if kind in {'sophia', 'sophia_g', 'sophiag'}:
+        from sophia import SophiaG
+        opt = SophiaG(model.parameters(), lr=cfg.sophia_lr, betas=(cfg.sophia_b1, cfg.sophia_b2), rho=cfg.sophia_rho, weight_decay=cfg.sophia_wd)
+        sophia_meta = {'k_hess': int(cfg.sophia_k)}
+        return opt, sophia_meta
+    raise ValueError(f"Unknown optimizer: {cfg.optimizer}")
 
 
 def train(cfg: TrainConfig):
@@ -225,6 +340,8 @@ def train(cfg: TrainConfig):
     np.random.seed(cfg.seed)
 
     device = torch.device(cfg.device if torch.cuda.is_available() else 'cpu')
+
+    # Data
     eval_sequences = max(cfg.eval_take, cfg.eval_iters * cfg.batch_size)
     data = HFStreamingBatcher(
         dataset_name=cfg.dataset_name,
@@ -238,8 +355,8 @@ def train(cfg: TrainConfig):
         eval_sequences=eval_sequences,
     )
 
+    # Model
     cfg.vocab_size = len(tokenizer)
-
     model = TinyMoETransformer(
         vocab_size=cfg.vocab_size,
         n_layer=cfg.n_layer,
@@ -268,9 +385,8 @@ def train(cfg: TrainConfig):
     total_params = model.num_parameters()
     print(f"Model params: {total_params:,} ({total_params/1e6:.2f}M)")
     print(f"Config: layers={cfg.n_layer}, d_model={cfg.d_model}, heads={cfg.n_head}, experts={cfg.n_experts}")
-    compiled_enabled = False
+
     if cfg.compile and hasattr(torch, 'compile'):
-        # Configure inductor to skip cudagraphs for dynamic shapes (MoE token counts vary per step)
         try:
             import torch._inductor.config as inductor_config
             if hasattr(inductor_config.triton, 'cudagraph_skip_dynamic_graphs'):
@@ -283,33 +399,30 @@ def train(cfg: TrainConfig):
             pass
         try:
             model = torch.compile(model, mode='max-autotune')
-            compiled_enabled = True
         except Exception as e:
             print(f"torch.compile failed ({e}); continuing without compile.")
 
-    # Optimizer
-    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate, betas=(cfg.beta1, cfg.beta2), weight_decay=cfg.weight_decay)
+    optimizer, sophia_meta = _build_optimizer(cfg, model)
 
-    # Logging and checkpoints
     logger = WandBLogger(project=cfg.wandb_project, run_name=cfg.wandb_run_name)
     logger.watch(model)
     ckpt_dir = Path(cfg.checkpoint_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    # Training loop
-    best_val = float('inf')
-    tokens_seen = 0
-    tokens_cum = 0  # cumulative tokens for plotting x-axis in billions
+    start_iter, best_val = _maybe_resume(model, optimizer, cfg)
+
+    tokens_cum = 0
     t0 = time.time()
     clip_cum = 0
 
-    for it in range(cfg.max_iters):
+    for it in range(start_iter, cfg.max_iters + 1):
         # LR schedule
         lr = cosine_lr(it, cfg.learning_rate, cfg.min_lr, cfg.warmup_iters, cfg.lr_decay_iters)
-        for pg in optimizer.param_groups:
-            pg['lr'] = lr
+        if hasattr(optimizer, 'param_groups'):
+            for pg in optimizer.param_groups:
+                pg['lr'] = lr
 
-        # Update router schedules (temperature and noise) per-step
+        # Router dynamics schedule per-step
         curr_temp = _anneal_linear(it, cfg.router_temp_init, cfg.router_temp_final, cfg.router_temp_anneal_iters)
         curr_noise = _anneal_linear(it, cfg.router_noise_std_init, 0.0, cfg.router_noise_decay_iters)
         for blk in model.h:
@@ -317,18 +430,19 @@ def train(cfg: TrainConfig):
                 blk.moe.router.set_router_state(curr_temp, curr_noise)
                 blk.moe.router.noise_type = cfg.router_noise_type
 
-        optimizer.zero_grad(set_to_none=True)
+        if hasattr(optimizer, 'zero_grad'):
+            optimizer.zero_grad(set_to_none=True)
         total_loss = 0.0
         last_router_metrics = None
         me_list, sv_list = [], []
-        for micro in range(cfg.gradient_accumulation_steps):
+        for _ in range(cfg.gradient_accumulation_steps):
             x, y = data.get_batch('train', cfg.batch_size)
             logits, loss = model(x, y)
             loss = loss / max(1, cfg.gradient_accumulation_steps)
             loss.backward()
-            total_loss += loss.item()
+            total_loss += float(loss.item())
 
-            # Gather router/expert stats from this micro-step (use the last one for logging)
+            # Router stats from the last micro-step only
             with torch.no_grad():
                 auxs, max_fracs, num_active, drops, tpm, ent = [], [], [], [], [], []
                 for blk in model.h:
@@ -340,7 +454,6 @@ def train(cfg: TrainConfig):
                         drops.append(float(st['drop_frac']))
                         tpm.append(float(st['top1_p_mean']))
                         ent.append(float(st['entropy_mean']))
-                        # per-expert routed vs served fractions
                         if 'me' in st and 'served' in st:
                             me_list.append(st['me'].float().cpu())
                             sv_list.append(st['served'].float().cpu())
@@ -356,8 +469,6 @@ def train(cfg: TrainConfig):
                         'router/entropy_mean': sum(ent) / len(ent),
                     }
                     last_router_metrics['router/collapsed'] = 1 if last_router_metrics['router/max_frac_max'] >= 0.90 or last_router_metrics['router/active_min'] <= 1 else 0
-                else:
-                    last_router_metrics = None
 
         # Gradient clip
         if cfg.grad_clip is not None and cfg.grad_clip > 0:
@@ -365,26 +476,48 @@ def train(cfg: TrainConfig):
             if torch.isfinite(norm):
                 clip_cum += int(norm > cfg.grad_clip)
 
-        optimizer.step()
+        # Optimizer step (Sophia variants need bs=tokens/iter)
+        try:
+            optimizer.step(bs=int(cfg.batch_size * cfg.block_size * cfg.gradient_accumulation_steps))
+        except TypeError:
+            optimizer.step()
 
-        # Logging
-        step_tokens = int(cfg.batch_size * cfg.block_size * cfg.gradient_accumulation_steps)
-        tokens_seen += step_tokens
-        tokens_cum += step_tokens
-        if (it % cfg.log_interval) == 0:
-            dt = max(1e-9, time.time() - t0)
-            tps = tokens_seen / dt
+        # Sophia Hessian EMA update
+        if sophia_meta is not None:
+            k = max(1, int(sophia_meta.get('k_hess', 10)))
+            if (it + 1) % k == 0:
+                x_s, _ = data.get_batch('train', cfg.batch_size)
+                model.zero_grad(set_to_none=True)
+                logits, _ = model(x_s, None)
+                with torch.no_grad():
+                    y_samp = torch.distributions.Categorical(logits=logits.float()).sample()
+                loss_s = F.cross_entropy(logits.reshape(-1, logits.size(-1)).float(), y_samp.reshape(-1))
+                loss_s.backward()
+                try:
+                    optimizer.update_hessian()
+                except Exception:
+                    pass
+
+        # Logging every cfg.log_interval
+        if (it % cfg.log_interval) == 0 and it > start_iter:
+            step_tokens = int(cfg.batch_size * cfg.block_size * cfg.gradient_accumulation_steps)
+            tokens_cum += step_tokens
+            tps = step_tokens * cfg.log_interval / max(1e-6, (time.time() - t0))
             avg_loss = total_loss
             metrics = {
                 'train/loss': avg_loss,
                 'lr': lr,
                 'router/temp': curr_temp,
                 'router/noise_std': curr_noise,
+                'grad/clipped_cum': int(clip_cum),
+                'train/tokens_b': tokens_cum / 1e9,
             }
-            metrics['grad/clipped_cum'] = int(clip_cum)
+            if last_router_metrics:
+                metrics.update(last_router_metrics)
+
             # Aggregate and log per-expert demand vs served fractions
             if me_list:
-                import torch as _torch
+                _torch = torch
                 me_avg = _torch.stack(me_list).mean(0)
                 sv_avg = _torch.stack(sv_list).mean(0)
                 for e in range(len(me_avg)):
@@ -394,11 +527,21 @@ def train(cfg: TrainConfig):
                 metrics['router/frac_srv_max'] = float(sv_avg.max())
                 metrics['router/active_dem'] = int((me_avg > 0).sum())
                 metrics['router/active_srv'] = int((sv_avg > 0).sum())
-            # cumulative tokens in billions for x-axis
-            metrics['train/tokens_b'] = tokens_cum / 1e9
-            if last_router_metrics:
-                metrics.update(last_router_metrics)
+
+                # Combined utilization plot (served vs demand across experts)
+                try:
+                    import wandb as _wb
+                    xs = list(range(len(me_avg)))
+                    ys = [[float(v) for v in sv_avg.tolist()], [float(v) for v in me_avg.tolist()]]
+                    util_plot = _wb.plot.line_series(xs=xs, ys=ys, keys=['served','demand'], title='Expert Utilization', xname='expert')
+                    metrics['router/util_plot'] = util_plot
+                    metrics['router/frac_srv_sum'] = float(sv_avg.sum())
+                    metrics['router/frac_dem_sum'] = float(me_avg.sum())
+                except Exception:
+                    pass
+
             logger.log_metrics(metrics, step=it)
+
             if last_router_metrics:
                 rf = last_router_metrics['router/max_frac_max']
                 na = last_router_metrics['router/active_min']
@@ -406,22 +549,32 @@ def train(cfg: TrainConfig):
                 print(f"iter {it:6d} | loss {avg_loss:.4f} | lr {lr:.3e} | {tps:.0f} tok/s | r_max {rf:.2f} act_min {na} col {col}")
             else:
                 print(f"iter {it:6d} | loss {avg_loss:.4f} | lr {lr:.3e} | {tps:.0f} tok/s")
-            t0 = time.time(); tokens_seen = 0
+            t0 = time.time()
 
-        # Eval
-        if (it % cfg.eval_interval) == 0:
+        # Eval + checkpoint
+        if (it % cfg.eval_interval) == 0 and it > start_iter:
             val_loss = evaluate(model, data, cfg, cfg.eval_iters)
             logger.log_metrics({'val/loss': val_loss, 'val/ppl': math.exp(min(20.0, val_loss))}, step=it)
             print(f"eval | val_loss {val_loss:.4f}")
-            try:
-                torch.save({'model': model.state_dict(), 'cfg': asdict(cfg), 'val_loss': float(val_loss), 'iter': it}, Path(cfg.checkpoint_dir) / 'last_moe_bf16.pt')
-            except Exception:
-                pass
-
+            # save 'last'
+            _save_ckpt(ckpt_dir / 'last_moe_bf16.pt', model, optimizer, cfg, it, val_loss)
+            # save 'best' on improvement
             if val_loss < best_val:
                 best_val = val_loss
-                ckpt_path = Path(cfg.checkpoint_dir) / 'best_moe_bf16.pt'
-                torch.save({'model': model.state_dict(), 'cfg': asdict(cfg), 'val_loss': val_loss, 'iter': it}, ckpt_path)
+                _save_ckpt(ckpt_dir / 'best_moe_bf16.pt', model, optimizer, cfg, it, val_loss)
+
+        # Periodic checkpointing
+        if cfg.save_interval and it > start_iter and (it % cfg.save_interval) == 0:
+            tag = f"iter_{it:06d}.pt"
+            _save_ckpt(ckpt_dir / tag, model, optimizer, cfg, it, None)
+            if cfg.keep_checkpoints and cfg.keep_checkpoints > 0:
+                ckpts = sorted(ckpt_dir.glob('iter_*.pt'))
+                if len(ckpts) > cfg.keep_checkpoints:
+                    for pth in ckpts[:len(ckpts) - cfg.keep_checkpoints]:
+                        try:
+                            pth.unlink()
+                        except Exception:
+                            pass
 
     logger.set_summary(best_val_loss=best_val, params=total_params)
     logger.finish()
@@ -446,13 +599,13 @@ def main():
     p.set_defaults(dropless=True)
     p.add_argument('--load_balance_alpha', type=float, default=0.05)
     p.add_argument('--router_z_loss_coef', type=float, default=0.0)
-    p.add_argument('--attn_gate', type=str, default='none', choices=['none', 'sigmoid_head'], help='Enable SDPA + elementwise head-specific sigmoid gate')
+    p.add_argument('--attn_gate', type=str, default='none', choices=['none', 'sigmoid_head'])
     p.add_argument('--use_rope', dest='use_rope', action='store_true')
     p.add_argument('--no-use_rope', dest='use_rope', action='store_false')
     p.set_defaults(use_rope=True)
     p.add_argument('--rope_theta', type=float, default=10000.0)
     # QK-Norm
-    p.add_argument('--qk_norm', action='store_true', help='Apply RMSNorm to Q and K before RoPE')
+    p.add_argument('--qk_norm', action='store_true')
     p.add_argument('--qk_norm_eps', type=float, default=1e-6)
     # Router dynamics CLI
     p.add_argument('--router_temp_init', type=float, default=1.5)
@@ -461,7 +614,7 @@ def main():
     p.add_argument('--router_noise_std_init', type=float, default=0.5)
     p.add_argument('--router_noise_decay_iters', type=int, default=1000)
     p.add_argument('--router_noise_type', type=str, default='gumbel', choices=['gumbel', 'gaussian'])
-    p.add_argument('--moe_grouped', action='store_true', help='Use grouped/padded MoE with batched GEMMs (capacity mode)')
+    p.add_argument('--moe_grouped', action='store_true')
 
     # Train
     p.add_argument('--device', type=str, default='cuda')
@@ -481,14 +634,31 @@ def main():
     p.add_argument('--compile', action='store_true')
     p.add_argument('--seed', type=int, default=1337)
 
-    # IO
+    # Data
     p.add_argument('--dataset_name', type=str, default='HuggingFaceFW/fineweb-edu')
     p.add_argument('--dataset_config', type=str, default='sample-10BT')
     p.add_argument('--text_key', type=str, default='text')
     p.add_argument('--shuffle_buffer', type=int, default=8192)
-    p.add_argument('--eval_take', type=int, default=512, help='Number of streaming sequences cached for eval (>= eval_iters * batch_size).')
+    p.add_argument('--eval_take', type=int, default=512)
+
+    # IO
     p.add_argument('--checkpoint_dir', type=str, default='checkpoints_moe_bf16')
     p.add_argument('--log_interval', type=int, default=10)
+    p.add_argument('--save_interval', type=int, default=0)
+    p.add_argument('--keep_checkpoints', type=int, default=3)
+    p.add_argument('--resume', type=str, default=None)
+    p.add_argument('--auto_resume', action='store_true')
+
+    # Optimizer
+    p.add_argument('--optimizer', type=str, default='adamw', choices=['adamw','muon_sophia','sophia'])
+    p.add_argument('--muon_lr', type=float, default=3e-2)
+    p.add_argument('--muon_wd', type=float, default=1e-2)
+    p.add_argument('--sophia_lr', type=float, default=1e-3)
+    p.add_argument('--sophia_b1', type=float, default=0.965)
+    p.add_argument('--sophia_b2', type=float, default=0.99)
+    p.add_argument('--sophia_rho', type=float, default=0.1)
+    p.add_argument('--sophia_wd', type=float, default=0.2)
+    p.add_argument('--sophia_k', type=int, default=10)
 
     # Logging
     p.add_argument('--wandb_project', type=str, default='moe-bf16-experiments_v2')
@@ -497,7 +667,6 @@ def main():
     args = p.parse_args()
     cfg = TrainConfig(**vars(args))
 
-    # Print a quick expert size estimate
     d = cfg.d_model
     params_per_expert = 8 * (d ** 2)
     print(f"Estimated params/expert (SwiGLU): ~{params_per_expert/1e6:.2f}M for d={d}")
@@ -506,3 +675,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
