@@ -659,7 +659,8 @@ class GQA(nn.Module):
     Replicates K/V across groups to match Q heads, then uses SDPA.
     """
     def __init__(self, d_model: int, n_head: int, n_kv_heads: int, bias: bool = False, dropout: float = 0.0,
-                 qk_norm: bool = False, qk_norm_eps: float = 1e-6):
+                 qk_norm: bool = False, qk_norm_eps: float = 1e-6, use_fp8: bool = False):
+        self.use_fp8 = bool(use_fp8)
         super().__init__()
         assert d_model % n_head == 0
         assert n_head % n_kv_heads == 0
@@ -710,7 +711,8 @@ class GQA(nn.Module):
 
 class GatedGQA(nn.Module):
     def __init__(self, d_model: int, n_head: int, n_kv_heads: int, bias: bool = False, dropout: float = 0.0,
-                 qk_norm: bool = False, qk_norm_eps: float = 1e-6):
+                 qk_norm: bool = False, qk_norm_eps: float = 1e-6, use_fp8: bool = False):
+        self.use_fp8 = bool(use_fp8)
         super().__init__()
         assert d_model % n_head == 0
         assert n_head % n_kv_heads == 0
