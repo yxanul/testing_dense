@@ -351,6 +351,7 @@ def get_gpt2_medium_config():
         mlp_type="swiglu",
         use_fused_qkv=True,
         use_fused_mlp=False,
+        use_rmsnorm=True,  # Use te.RMSNorm for FP8 compatibility
     )
 
 
@@ -364,6 +365,7 @@ def get_gpt2_large_config():
         mlp_type="swiglu",
         use_fused_qkv=True,
         use_fused_mlp=False,
+        use_rmsnorm=True,  # Use te.RMSNorm for FP8 compatibility
     )
 
 
@@ -469,7 +471,7 @@ if __name__ == "__main__":
     print("✅ Fused QKV projection (1.84x speedup)")
     print("❌ NO fused MLP (benchmarks show it's slower)")
     print("✅ PyTorch SDPA (10x faster attention)")
-    print("✅ FP8 HYBRID format (for compute acceleration)")
+    print("✅ FP8 HYBRID format (requires te.RMSNorm/te.LayerNorm)")
     print("✅ GQA for memory efficiency")
     print("❌ NO torch.compile (slower with FP8)")
     print("=" * 80)
@@ -521,9 +523,10 @@ if __name__ == "__main__":
     print("IMPORTANT NOTES:")
     print("-" * 80)
     print("1. FP8 in TransformerEngine is for COMPUTE acceleration, not memory savings")
-    print("2. Weights remain in BF16 and are quantized to FP8 during GEMM operations")
+    print("2. Custom norm layers break FP8 flow - use te.RMSNorm/te.LayerNorm")
     print("3. RTX 5090 may not have native FP8 support (Ada architecture)")
-    print("4. For true FP8 benefits, you need Hopper GPUs (H100/H200)")
+    print("4. Weights stay BF16, quantized to FP8 during GEMM operations")
+    print("5. For true FP8 benefits, you need Hopper GPUs (H100/H200)")
     print("\nIf FP8 shows no speedup on your GPU:")
     print("- Set use_fp8=False for better performance")
     print("- RTX 5090 excels at BF16, use that instead")
