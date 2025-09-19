@@ -6,7 +6,8 @@ echo GPT-2 GATED ATTENTION EXPERIMENTS
 echo ==========================================
 
 REM Common arguments for quick testing
-set COMMON_ARGS=--batch_size 12 --sequence_length 2048 --num_train_steps 10000 --eval_interval 500
+REM Note: BS=12, Seq=2048 gives ~130K tokens/sec with backward pass on RTX 5090
+set COMMON_ARGS=--batch_size 12 --sequence_length 2048 --gradient_accumulation_steps 1 --num_train_steps 10000 --eval_interval 500 --max_grad_norm 1.0
 
 echo.
 echo 1. Training BASELINE model (no gated attention)...

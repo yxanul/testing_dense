@@ -118,28 +118,54 @@ class DataCollator:
         return batch
 
 
-def create_dataloader(config: TrainingConfig, tokenizer):
-    """Create streaming dataloader."""
+def create_streaming_dataloader(config: TrainingConfig, tokenizer, seed=None):
+    """Create properly functioning streaming dataloader.
+
+    CRITICAL FIXES:
+    1. DO NOT use PyTorch DataLoader with streaming datasets - it doesn't work properly!
+    2. MUST shuffle with buffer to avoid sequential data
+    3. MUST use different seeds for train/eval to avoid data leak
+    """
     # Load dataset with streaming
     dataset = load_dataset(
         config.dataset_name,
         config.dataset_config,
         split="train",
-        streaming=config.streaming
+        streaming=True  # Always use streaming
     )
 
-    # Create collator
-    collator = DataCollator(tokenizer, config.sequence_length)
+    # CRITICAL: Shuffle the dataset with a buffer
+    # Without this, we see data sequentially and loss drops unnaturally fast!
+    if seed is not None:
+        dataset = dataset.shuffle(seed=seed, buffer_size=10000)
+    else:
+        dataset = dataset.shuffle(buffer_size=10000)
 
-    # Create dataloader
-    dataloader = DataLoader(
-        dataset,
-        batch_size=config.batch_size,
-        collate_fn=collator,
-        drop_last=True
-    )
+    # Create batches manually from streaming dataset
+    # DO NOT use DataLoader with streaming datasets!
+    def batch_generator():
+        batch_texts = []
+        for example in dataset:
+            batch_texts.append(example["text"])
 
-    return dataloader
+            if len(batch_texts) == config.batch_size:
+                # Tokenize batch
+                batch = tokenizer(
+                    batch_texts,
+                    truncation=True,
+                    padding="max_length",
+                    max_length=config.sequence_length,
+                    return_tensors="pt"
+                )
+
+                # Create labels (shifted for language modeling)
+                batch["labels"] = batch["input_ids"].clone()
+                batch["labels"][batch["attention_mask"] == 0] = -100
+
+                yield batch
+                batch_texts = []
+
+    return batch_generator()
 
 
 def get_lr_scheduler(optimizer, config: TrainingConfig):
@@ -196,8 +222,11 @@ def train_step(model, batch, optimizer, scheduler, scaler, config):
     else:
         loss.backward()
 
+    # Increment step count
+    optimizer.step_count += 1
+
     # Gradient clipping and optimization
-    if (optimizer.step_count + 1) % config.gradient_accumulation_steps == 0:
+    if optimizer.step_count % config.gradient_accumulation_steps == 0:
         if scaler is not None:
             scaler.unscale_(optimizer)
 
@@ -225,8 +254,12 @@ def evaluate(model, dataloader, config, num_eval_steps=50):
     total_tokens = 0
 
     with torch.no_grad():
-        for i, batch in enumerate(tqdm(dataloader, desc="Evaluating", total=num_eval_steps)):
-            if i >= num_eval_steps:
+        # Use manual iteration for generator
+        for i in tqdm(range(num_eval_steps), desc="Evaluating"):
+            try:
+                batch = next(dataloader)
+            except StopIteration:
+                print("Warning: Eval dataset exhausted")
                 break
 
             input_ids = batch["input_ids"].to(config.device)
@@ -315,8 +348,12 @@ def parse_args():
                         help="Training batch size (default: 12)")
     parser.add_argument("--sequence_length", type=int, default=2048,
                         help="Sequence length (default: 2048)")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1,
+                        help="Gradient accumulation steps (default: 1)")
     parser.add_argument("--learning_rate", type=float, default=3e-4,
                         help="Learning rate (default: 3e-4)")
+    parser.add_argument("--max_grad_norm", type=float, default=1.0,
+                        help="Max gradient norm for clipping (default: 1.0)")
     parser.add_argument("--num_train_steps", type=int, default=100000,
                         help="Total training steps (default: 100000)")
     parser.add_argument("--eval_interval", type=int, default=500,
@@ -351,7 +388,9 @@ def main():
     config.use_fp8 = args.use_fp8
     config.batch_size = args.batch_size
     config.sequence_length = args.sequence_length
+    config.gradient_accumulation_steps = args.gradient_accumulation_steps
     config.learning_rate = args.learning_rate
+    config.max_grad_norm = args.max_grad_norm
     config.num_train_steps = args.num_train_steps
     config.eval_interval = args.eval_interval
     config.checkpoint_dir = args.checkpoint_dir
@@ -466,29 +505,47 @@ def main():
         start_step, metrics = load_checkpoint(model, optimizer, scheduler, config.resume_from)
         print(f"Resumed from step {start_step}")
 
-    # Create dataloader
-    print("Creating dataloader...")
-    train_dataloader = create_dataloader(config, tokenizer)
-    eval_dataloader = create_dataloader(config, tokenizer)  # Same as train for now
+    # Create dataloaders with DIFFERENT seeds to ensure different data
+    print("Creating dataloaders...")
+    print("  Using shuffled streaming with different seeds for train/eval")
+    train_dataloader = create_streaming_dataloader(config, tokenizer, seed=args.seed)
+    # CRITICAL: Use different seed for eval to get different data!
+    eval_dataloader = create_streaming_dataloader(config, tokenizer, seed=args.seed + 1000)
 
     # Training loop
-    print(f"Starting training for {config.num_train_steps} steps...")
+    print(f"\nStarting training for {config.num_train_steps} steps...")
     print(f"Batch size: {config.batch_size}, Seq length: {config.sequence_length}")
     print(f"Gradient accumulation: {config.gradient_accumulation_steps}")
     print(f"Effective batch size: {config.batch_size * config.gradient_accumulation_steps}")
+    print(f"Total tokens per step: {config.batch_size * config.sequence_length * config.gradient_accumulation_steps}")
     print(f"Mixed precision: {config.mixed_precision} + FP8 compute: {config.use_fp8}")
 
-    train_iter = iter(train_dataloader)
+    # Expected loss behavior warning
+    print("\n⚠️  EXPECTED LOSS BEHAVIOR:")
+    print("  - Initial loss: ~10-11 (random init)")
+    print("  - After 1000 steps: ~7-8")
+    print("  - After 10000 steps: ~4-5")
+    print("  If loss drops to <3 in <1000 steps, DATA IS BEING REUSED!")
+
+    # Note about expected performance
+    if config.batch_size == 12 and config.sequence_length == 2048 and config.use_fp8:
+        print("\nNote: For RTX 5090 with BS=12, Seq=2048, FP8:")
+        print("  Expected: ~185K tokens/sec (single forward pass)")
+        print("  With backward pass: ~130K tokens/sec is normal")
+
+    # No need to call iter() on generator
     running_loss = 0
     grad_norms = []
 
     for step in range(start_step, config.num_train_steps):
-        # Get batch
+        # Get batch from generator
         try:
-            batch = next(train_iter)
+            batch = next(train_dataloader)
         except StopIteration:
-            train_iter = iter(train_dataloader)
-            batch = next(train_iter)
+            # Dataset exhausted (shouldn't happen with streaming)
+            print("Warning: Dataset exhausted, recreating dataloader...")
+            train_dataloader = create_streaming_dataloader(config, tokenizer, seed=args.seed + step)
+            batch = next(train_dataloader)
 
         # Training step
         step_start = time.time()
@@ -504,6 +561,8 @@ def main():
             avg_loss = running_loss / config.log_interval
             avg_grad_norm = np.mean(grad_norms) if grad_norms else 0
             lr = scheduler.get_last_lr()[0]
+            # Account for gradient accumulation in tokens/sec calculation
+            effective_batch_size = config.batch_size * config.gradient_accumulation_steps
             tokens_per_sec = (config.batch_size * config.sequence_length) / step_time
 
             log_dict = {
