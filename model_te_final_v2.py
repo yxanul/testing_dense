@@ -507,14 +507,12 @@ def benchmark_large_scale():
     config = get_gpt2_small_config()
 
     # Test configurations: (batch_size, seq_len, grad_acc_steps)
+    # Focus on larger batches / GA as requested
     test_configs = [
-        (4, 512, 1),     # Small baseline
-        (8, 512, 1),     # Medium
-        (12, 512, 1),    # Large batch
-        (4, 2048, 1),    # Long sequence
-        (12, 2048, 1),   # Large batch + long seq
-        (4, 512, 12),    # Gradient accumulation (effective BS=48)
-        (12, 2048, 12),  # Maximum scale (effective BS=144)
+        (16, 1024, 1),   # 16 BA, 1 GA, 1024 seq
+        (16, 1024, 16),  # 16 BA, 16 GA, 1024 seq (effective BS=256)
+        (24, 1024, 1),   # 24 BA, 1 GA, 1024 seq
+        (24, 2048, 1),   # 24 BA, 1 GA, 2048 seq
     ]
 
     results = []
