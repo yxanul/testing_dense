@@ -31,10 +31,15 @@ for name, fmt in configs:
 
     # Check FP8 metadata
     print(f"Recipe format: {recipe.fp8_format}")
-    print(f"Forward format: {recipe.fp8_format.value.fwd}")
-    print(f"Backward format: {recipe.fp8_format.value.bwd}")
-    print(f"E4M3 max: {recipe.fp8_format.value.fwd.value.max_fwd}")
-    print(f"E5M2 max (for HYBRID bwd): {recipe.fp8_format.value.bwd.value.max_bwd if fmt == Format.HYBRID else 'N/A'}")
+
+    # Format details based on the enum
+    if fmt == Format.E4M3:
+        print(f"Uses E4M3 for both forward and backward")
+        print(f"E4M3 range: ±448")
+    elif fmt == Format.HYBRID:
+        print(f"Forward: E4M3 (range: ±448)")
+        print(f"Backward: E5M2 (range: ±57344)")
+        print(f"Better gradient precision with E5M2")
 
     # Backward pass
     loss = y.sum()
