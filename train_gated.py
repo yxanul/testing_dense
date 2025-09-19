@@ -205,10 +205,10 @@ def train_step(model, batch, optimizer, scheduler, scaler, config):
     # The model forward already uses: with te.fp8_autocast(enabled=self.config.use_fp8)
     # We just need bf16 for the outer context
     if config.mixed_precision == "bf16":
-        with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
             logits, loss = model(input_ids, labels=labels)
     elif config.mixed_precision == "fp16":
-        with torch.cuda.amp.autocast(dtype=torch.float16):
+        with torch.amp.autocast('cuda', dtype=torch.float16):
             logits, loss = model(input_ids, labels=labels)
     else:
         logits, loss = model(input_ids, labels=labels)
@@ -266,7 +266,7 @@ def evaluate(model, dataloader, config, num_eval_steps=50):
             labels = batch["labels"].to(config.device)
 
             # Forward pass
-            with torch.cuda.amp.autocast(enabled=config.mixed_precision != "fp32"):
+            with torch.amp.autocast('cuda', enabled=config.mixed_precision != "fp32"):
                 logits, loss = model(input_ids, labels=labels)
 
             # Accumulate loss
@@ -343,12 +343,12 @@ def parse_args():
                         help="Disable FP8")
 
     # Training arguments
-    parser.add_argument("--batch_size", type=int, default=12,
-                        help="Training batch size (default: 12)")
-    parser.add_argument("--sequence_length", type=int, default=2048,
-                        help="Sequence length (default: 2048)")
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=1,
-                        help="Gradient accumulation steps (default: 1)")
+    parser.add_argument("--batch_size", type=int, default=16,
+                        help="Training batch size (default: 16)")
+    parser.add_argument("--sequence_length", type=int, default=1024,
+                        help="Sequence length (default: 1024)")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=16,
+                        help="Gradient accumulation steps (default: 16)")
     parser.add_argument("--learning_rate", type=float, default=3e-4,
                         help="Learning rate (default: 3e-4)")
     parser.add_argument("--max_grad_norm", type=float, default=1.0,
@@ -528,10 +528,13 @@ def main():
     print("  If loss drops to <3 in <1000 steps, DATA IS BEING REUSED!")
 
     # Note about expected performance
-    if config.batch_size == 12 and config.sequence_length == 2048 and config.use_fp8:
-        print("\nNote: For RTX 5090 with BS=12, Seq=2048, FP8:")
-        print("  Expected: ~185K tokens/sec (single forward pass)")
-        print("  With backward pass: ~130K tokens/sec is normal")
+    if config.use_fp8:
+        print(f"\nNote: For RTX 5090 with BS={config.batch_size}, Seq={config.sequence_length}, FP8:")
+        if config.sequence_length == 1024:
+            print("  Expected: ~250-300K tokens/sec (shorter sequences = higher throughput)")
+        else:
+            print("  Expected: ~185K tokens/sec (single forward pass)")
+        print("  With backward pass + gradient accumulation: actual throughput varies")
 
     # Track both micro-steps and actual optimization steps
     running_loss = 0
@@ -557,6 +560,27 @@ def main():
         if grad_norm is not None:
             grad_norms.append(grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm)
             global_step += 1  # Increment global step when optimizer actually steps
+
+            # Evaluation - ONLY when we just incremented to an eval step
+            if global_step % (config.eval_interval // config.gradient_accumulation_steps) == 0:
+                print(f"\nEvaluating at global step {global_step}...")
+                eval_loss, eval_ppl = evaluate(model, eval_dataloader, config)
+
+                eval_dict = {
+                    "eval/loss": eval_loss,
+                    "eval/perplexity": eval_ppl
+                }
+                wandb.log(eval_dict, step=global_step)
+
+                print(f"Eval Loss: {eval_loss:.4f} | Eval PPL: {eval_ppl:.2f}\n")
+
+            # Save checkpoint - ONLY when we just incremented to a save step
+            if global_step % (config.save_interval // config.gradient_accumulation_steps) == 0:
+                metrics = {
+                    "train_loss": running_loss / config.log_interval if running_loss > 0 else 0,
+                    "global_step": global_step
+                }
+                save_checkpoint(model, optimizer, scheduler, global_step, config, metrics)
 
         # Logging (every N micro-steps)
         if (step + 1) % config.log_interval == 0:
@@ -587,27 +611,6 @@ def main():
 
             running_loss = 0
             grad_norms = []
-
-        # Evaluation (based on global steps)
-        if global_step > 0 and global_step % (config.eval_interval // config.gradient_accumulation_steps) == 0:
-            print(f"\nEvaluating at global step {global_step}...")
-            eval_loss, eval_ppl = evaluate(model, eval_dataloader, config)
-
-            eval_dict = {
-                "eval/loss": eval_loss,
-                "eval/perplexity": eval_ppl
-            }
-            wandb.log(eval_dict, step=global_step)
-
-            print(f"Eval Loss: {eval_loss:.4f} | Eval PPL: {eval_ppl:.2f}\n")
-
-        # Save checkpoint (based on global steps)
-        if global_step > 0 and global_step % (config.save_interval // config.gradient_accumulation_steps) == 0:
-            metrics = {
-                "train_loss": running_loss / config.log_interval if running_loss > 0 else 0,
-                "step": step + 1
-            }
-            save_checkpoint(model, optimizer, scheduler, step + 1, config, metrics)
 
     # Final evaluation
     print("\nFinal evaluation...")
