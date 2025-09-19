@@ -139,7 +139,7 @@ if __name__ == "__main__":
 
     # Forward with FP8
     logits = model(x, use_fp8=True)
-    loss = F.cross_entropy(logits.view(-1, 50264), y.view(-1))
+    loss = F.cross_entropy(logits.reshape(-1, 50264), y.reshape(-1))
 
     # Backward
     opt = torch.optim.AdamW(model.parameters(), lr=3e-4)

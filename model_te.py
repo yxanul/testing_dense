@@ -44,9 +44,9 @@ from transformer_engine.common.recipe import DelayedScaling, Format, MXFP8BlockS
 # -----------------------------
 @dataclass
 class GPT2Config:
-    vocab_size: int = 50264  # For MXFP8, use 50272 (divisible by 32)
+    vocab_size: int = 50304  # Must be divisible by 32 for FP8 (50304 = 1572*32)
     n_positions: int = 1024
-    n_embd: int = 768          # GPT-2 small (768 = 24*32, OK for MXFP8)
+    n_embd: int = 768          # GPT-2 small (768 = 24*32, OK for FP8)
     n_layer: int = 12
     n_head: int = 12
     dropout: float = 0.1       # embedding/residual dropout
@@ -209,11 +209,7 @@ if __name__ == "__main__":
     print(f"Testing with recipe_type: {recipe_type}")
 
     cfg = GPT2Config(recipe_type=recipe_type)
-
-    # Adjust vocab_size for MXFP8 (must be divisible by 32)
-    if recipe_type == "mxfp8":
-        cfg.vocab_size = 50272  # Next multiple of 32 after 50264
-        print(f"Adjusted vocab_size to {cfg.vocab_size} for MXFP8 compatibility")
+    print(f"Using vocab_size={cfg.vocab_size} (divisible by 32: {cfg.vocab_size % 32 == 0})")
 
     model = GPT2TEModel(cfg).to(device)
 
