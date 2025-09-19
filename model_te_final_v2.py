@@ -339,7 +339,7 @@ def get_gpt2_small_config():
         n_kv_head=2,  # GQA 4:1 (12 heads -> 3 KV heads)
         mlp_type="swiglu",
         use_fused_qkv=True,
-        use_fused_mlp=True,  # Important: fusion is slower!
+        use_fused_mlp=False,  # Important: fusion is slower!
         use_rmsnorm=True,  # Use te.RMSNorm for FP8 compatibility
     )
 
