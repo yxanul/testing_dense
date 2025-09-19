@@ -513,7 +513,7 @@ def benchmark_large_scale():
         #(16, 1024, 16),  # 16 BA, 16 GA, 1024 seq (effective BS=256)
         #(24, 1024, 1),   # 24 BA, 1 GA, 1024 seq
         #(48, 512, 2),   # 48 BA, 2 GA, 512 seq
-        (128, 512, 1),  # 128 BA, 1 GA, 512 seq
+        (64, 512, 2),  # 64 BA, 2 GA, 512 seq
     ]
 
     results = []
