@@ -86,6 +86,12 @@ class TrainConfig:
     compile: bool = False
     seed: int = 1337
     fp8: bool = False
+    # Profiling
+    profile: bool = False
+    profile_dir: str = 'profiles'
+    profile_wait: int = 5
+    profile_warmup: int = 5
+    profile_active: int = 20
 
     # Data
     dataset_name: str = 'HuggingFaceFW/fineweb-edu'
@@ -456,6 +462,27 @@ def train(cfg: TrainConfig):
     t0 = time.time()
     clip_cum = 0
 
+    # Optional profiler
+    prof = None
+    if cfg.profile:
+        try:
+            import torch.profiler as tp
+            acts = [tp.ProfilerActivity.CPU]
+            if torch.cuda.is_available():
+                acts.append(tp.ProfilerActivity.CUDA)
+            sched = tp.schedule(wait=cfg.profile_wait, warmup=cfg.profile_warmup, active=cfg.profile_active, repeat=1)
+            prof = tp.profile(
+                activities=acts,
+                schedule=sched,
+                on_trace_ready=tp.tensorboard_trace_handler(cfg.profile_dir),
+                record_shapes=True,
+                profile_memory=True,
+                with_stack=False,
+            )
+            prof.__enter__()
+        except Exception as _:
+            prof = None
+
     for it in range(start_iter, cfg.max_iters + 1):
         # LR schedule
         lr = cosine_lr(it, cfg.learning_rate, cfg.min_lr, cfg.warmup_iters, cfg.lr_decay_iters)
@@ -494,9 +521,19 @@ def train(cfg: TrainConfig):
         me_list, sv_list = [], []
         for _ in range(cfg.gradient_accumulation_steps):
             x, y = data.get_batch('train', cfg.batch_size)
-            logits, loss = model(x, y)
+            if cfg.profile:
+                import torch.profiler as tp  # type: ignore
+                with tp.record_function('forward'):
+                    logits, loss = model(x, y)
+            else:
+                logits, loss = model(x, y)
             loss = loss / max(1, cfg.gradient_accumulation_steps)
-            loss.backward()
+            if cfg.profile:
+                import torch.profiler as tp  # type: ignore
+                with tp.record_function('backward'):
+                    loss.backward()
+            else:
+                loss.backward()
             total_loss += float(loss.item())
 
             # Router stats from the last micro-step only
@@ -535,9 +572,19 @@ def train(cfg: TrainConfig):
 
         # Optimizer step (Sophia variants need bs=tokens/iter)
         try:
-            optimizer.step(bs=int(cfg.batch_size * cfg.block_size * cfg.gradient_accumulation_steps))
+            if cfg.profile:
+                import torch.profiler as tp  # type: ignore
+                with tp.record_function('optimizer_step'):
+                    optimizer.step(bs=int(cfg.batch_size * cfg.block_size * cfg.gradient_accumulation_steps))
+            else:
+                optimizer.step(bs=int(cfg.batch_size * cfg.block_size * cfg.gradient_accumulation_steps))
         except TypeError:
-            optimizer.step()
+            if cfg.profile:
+                import torch.profiler as tp  # type: ignore
+                with tp.record_function('optimizer_step'):
+                    optimizer.step()
+            else:
+                optimizer.step()
 
         # Sophia Hessian EMA update
         if sophia_meta is not None:
@@ -642,6 +689,19 @@ def train(cfg: TrainConfig):
                         except Exception:
                             pass
 
+        # profiler step
+        if prof is not None:
+            try:
+                prof.step()
+            except Exception:
+                pass
+
+    if prof is not None:
+        try:
+            prof.__exit__(None, None, None)
+        except Exception:
+            pass
+
     logger.set_summary(best_val_loss=best_val, params=total_params)
     logger.finish()
 
@@ -700,6 +760,12 @@ def main():
     p.add_argument('--compile', action='store_true')
     p.add_argument('--seed', type=int, default=1337)
     p.add_argument('--fp8', action='store_true')
+    # Profiling
+    p.add_argument('--profile', action='store_true')
+    p.add_argument('--profile_dir', type=str, default='profiles')
+    p.add_argument('--profile_wait', type=int, default=5)
+    p.add_argument('--profile_warmup', type=int, default=5)
+    p.add_argument('--profile_active', type=int, default=20)
 
     # Data
     p.add_argument('--dataset_name', type=str, default='HuggingFaceFW/fineweb-edu')

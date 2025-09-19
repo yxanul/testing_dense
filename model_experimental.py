@@ -799,9 +799,19 @@ class TransformerBlock(nn.Module):
 
     def forward(self, x: torch.Tensor, rope_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         attn_in = self.ln1(x)
-        attn_out = self.attn(attn_in, rope_cache if self.use_rope else None)
+        try:
+            import torch.profiler as tp  # type: ignore
+            with tp.record_function('attn'):
+                attn_out = self.attn(attn_in, rope_cache if self.use_rope else None)
+        except Exception:
+            attn_out = self.attn(attn_in, rope_cache if self.use_rope else None)
         x = x + attn_out
-        y, aux = self.moe(self.ln2(x))
+        try:
+            import torch.profiler as tp  # type: ignore
+            with tp.record_function('moe'):
+                y, aux = self.moe(self.ln2(x))
+        except Exception:
+            y, aux = self.moe(self.ln2(x))
         x = x + y
         return x, aux
 
