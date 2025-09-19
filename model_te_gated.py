@@ -235,9 +235,12 @@ class GatedAttention(nn.Module):
             q, k = apply_rotary_pos_emb(q, k, cos, sin, position_ids)
 
         # QK normalization (optional)
+        # Apply normalization to stabilize attention scores
         if self.use_qk_norm:
-            q = self.q_norm(q)
-            k = self.k_norm(k)
+            # RMSNorm normalizes over the last dimension
+            # q, k are [B, H, S, D] - normalize over D (head_dim)
+            q = self.q_norm(q.contiguous())
+            k = self.k_norm(k.contiguous())
 
         # Compute attention with proper padding mask
         B_local, H, S_q, D = q.shape

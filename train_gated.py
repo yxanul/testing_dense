@@ -46,14 +46,14 @@ class TrainingConfig:
     batch_size: int = 32  # Batch size 32 for better GPU utilization
     sequence_length: int = 1024  # Block size 1024 (faster iterations)
     gradient_accumulation_steps: int = 16  # GA 16 for effective batch size of 512
-    learning_rate: float = 6e-4  # Good for large effective batch size
+    learning_rate: float = 6e-4  # Standard LR for large batch
     min_learning_rate: float = 6e-5  # Scaled proportionally
     use_attention_mask: bool = False  # Whether to mask padding in attention (costs ~10% performance)
     weight_decay: float = 0.1
     adam_beta1: float = 0.9
     adam_beta2: float = 0.95
     adam_epsilon: float = 1e-8
-    max_grad_norm: float = 1.0
+    max_grad_norm: float = 1.0  # Standard grad clipping
 
     # Scheduler
     warmup_steps: int = 500  # Reduced for faster warmup with GA=16
