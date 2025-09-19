@@ -36,7 +36,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import transformer_engine.pytorch as te
-from transformer_engine.common.recipe import DelayedScaling
+from transformer_engine.common.recipe import DelayedScaling, Format
 
 
 # -----------------------------
@@ -57,7 +57,10 @@ class GPT2Config:
     # TransformerEngine / precision knobs
     weights_dtype: torch.dtype = torch.bfloat16
     use_fp8: bool = True
-    fp8_recipe: Optional[DelayedScaling] = None  # None => use default recipe
+    # Force classic FP8 (no MXFP8) by default. You can still override via fp8_recipe.
+    # HYBRID = E4M3 for fwd, E5M2 for bwd/grad (works well on H100/Blackwell).
+    fp8_format: Format = Format.HYBRID
+    fp8_recipe: Optional[DelayedScaling] = None  # if None, we'll build one from fp8_format  # None => use default recipe
 
 
 # -----------------------------
@@ -101,7 +104,8 @@ class GPT2TEModel(nn.Module):
             self.lm_head.weight = self.wte.weight  # type: ignore[attr-defined]
 
         # FP8 recipe
-        self._fp8_recipe = cfg.fp8_recipe or DelayedScaling()
+        # FP8 recipe: use classic FP8 (DelayedScaling) explicitly, NOT MXFP8.
+        self._fp8_recipe = cfg.fp8_recipe or DelayedScaling(fp8_format=cfg.fp8_format)
 
     @staticmethod
     def _init_weights(module: nn.Module):
