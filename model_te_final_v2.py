@@ -24,7 +24,7 @@ class FinalConfig:
     vocab_size: int = 32768  # Power of 2, better for consumer GPUs
     n_positions: int = 2048
     n_embd: int = 768
-    n_layer: int = 12
+    n_layer: int = 24
     n_head: int = 12
     n_kv_head: Optional[int] = None  # For GQA (set to n_head//4 for 4:1)
 
