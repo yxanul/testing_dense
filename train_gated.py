@@ -134,12 +134,13 @@ def create_streaming_dataloader(config: TrainingConfig, tokenizer, seed=None):
         streaming=True  # Always use streaming
     )
 
-    # CRITICAL: Shuffle the dataset with a buffer
-    # Without this, we see data sequentially and loss drops unnaturally fast!
+    # CRITICAL: Shuffle the dataset with a large buffer for better randomization
+    # Larger buffer = better de-sequentialization of streaming data
+    buffer_size = 100000  # 100k for better randomization (was 10k)
     if seed is not None:
-        dataset = dataset.shuffle(seed=seed, buffer_size=10000)
+        dataset = dataset.shuffle(seed=seed, buffer_size=buffer_size)
     else:
-        dataset = dataset.shuffle(buffer_size=10000)
+        dataset = dataset.shuffle(buffer_size=buffer_size)
 
     # Create batches manually from streaming dataset
     # DO NOT use DataLoader with streaming datasets!
@@ -198,20 +199,20 @@ def train_step(model, batch, optimizer, scheduler, scaler, config):
 
     # Move batch to device
     input_ids = batch["input_ids"].to(config.device)
+    attention_mask = batch["attention_mask"].to(config.device)
     labels = batch["labels"].to(config.device)
-    # Note: attention_mask not needed - padding handled by labels=-100
 
     # FP8 is handled by TransformerEngine inside the model
     # The model forward already uses: with te.fp8_autocast(enabled=self.config.use_fp8)
     # We just need bf16 for the outer context
     if config.mixed_precision == "bf16":
         with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-            logits, loss = model(input_ids, labels=labels)
+            logits, loss = model(input_ids, attention_mask=attention_mask, labels=labels)
     elif config.mixed_precision == "fp16":
         with torch.amp.autocast('cuda', dtype=torch.float16):
-            logits, loss = model(input_ids, labels=labels)
+            logits, loss = model(input_ids, attention_mask=attention_mask, labels=labels)
     else:
-        logits, loss = model(input_ids, labels=labels)
+        logits, loss = model(input_ids, attention_mask=attention_mask, labels=labels)
 
     # Scale loss for gradient accumulation
     loss = loss / config.gradient_accumulation_steps
@@ -263,11 +264,13 @@ def evaluate(model, dataloader, config, num_eval_steps=50):
                 break
 
             input_ids = batch["input_ids"].to(config.device)
+            attention_mask = batch["attention_mask"].to(config.device)
             labels = batch["labels"].to(config.device)
 
-            # Forward pass
-            with torch.amp.autocast('cuda', enabled=config.mixed_precision != "fp32"):
-                logits, loss = model(input_ids, labels=labels)
+            # Forward pass - match training precision
+            dtype = torch.bfloat16 if config.mixed_precision == "bf16" else torch.float16
+            with torch.amp.autocast('cuda', dtype=dtype, enabled=config.mixed_precision != "fp32"):
+                logits, loss = model(input_ids, attention_mask=attention_mask, labels=labels)
 
             # Accumulate loss
             num_tokens = (labels != -100).sum().item()
@@ -477,15 +480,32 @@ def main():
         print("Compiling model...")
         model = torch.compile(model)
 
-    # Create optimizer
-    print("Creating optimizer...")
+    # Create optimizer with proper weight decay exclusions
+    print("Creating optimizer with weight decay exclusions...")
+
+    # Separate parameters into groups
+    decay_params = []
+    no_decay_params = []
+
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            # Exclude biases, norms, and embeddings from weight decay
+            if 'bias' in name or 'norm' in name or 'wte' in name or 'wpe' in name:
+                no_decay_params.append(param)
+            else:
+                decay_params.append(param)
+
+    print(f"  Parameters with weight decay: {len(decay_params)}")
+    print(f"  Parameters without weight decay: {len(no_decay_params)}")
+
     # Use fused AdamW when available (requires CUDA, provides ~10% speedup)
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
+    optimizer = torch.optim.AdamW([
+        {'params': decay_params, 'weight_decay': config.weight_decay},
+        {'params': no_decay_params, 'weight_decay': 0.0}
+    ],
         lr=config.learning_rate,
         betas=(config.adam_beta1, config.adam_beta2),
         eps=config.adam_epsilon,
-        weight_decay=config.weight_decay,
         fused=torch.cuda.is_available()  # Enable fused optimizer on CUDA
     )
     optimizer.step_count = 0  # Track steps for gradient accumulation

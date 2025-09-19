@@ -41,7 +41,6 @@ class GatedConfig:
     # Layer configuration
     layernorm_epsilon: float = 1e-5
     use_rmsnorm: bool = True  # MUST use te.RMSNorm for FP8 compatibility
-    norm_position: str = "pre"  # "pre" or "post"
 
     # MLP configuration
     ffn_hidden_size: Optional[int] = None
@@ -50,11 +49,9 @@ class GatedConfig:
     # Position embeddings
     position_embedding_type: str = "learned"  # "learned" or "rope"
     rope_theta: float = 10000.0
-    rope_scaling: Optional[dict] = None
 
     # Optimizations
     use_fused_qkv: bool = True
-    use_fused_mlp: bool = False  # Benchmarks show it's slower
     use_pytorch_sdpa: bool = True
     use_fp8: bool = True
 
@@ -176,18 +173,24 @@ class GatedAttention(nn.Module):
                 # Head-wise gating (fewer parameters)
                 gate_size = self.n_head
 
-            self.gate_proj = te.Linear(self.hidden_size, gate_size, bias=False)
+            self.gate_proj = te.Linear(self.hidden_size, gate_size, bias=True)
 
             if config.gate_activation == "sigmoid":
                 self.gate_activation = nn.Sigmoid()
+                # Initialize gate bias to ~2.0 so sigmoid(2) ≈ 0.88 (mostly pass-through at init)
+                with torch.no_grad():
+                    nn.init.constant_(self.gate_proj.bias, 2.0)
             else:  # silu
                 self.gate_activation = nn.SiLU()
+                # For SiLU, a smaller positive bias helps
+                with torch.no_grad():
+                    nn.init.constant_(self.gate_proj.bias, 1.0)
 
         self.out_proj = te.Linear(self.hidden_size, self.hidden_size, bias=True)
         self.attn_dropout = nn.Dropout(config.attn_dropout)
         self.use_sdpa = config.use_pytorch_sdpa
 
-    def forward(self, x, position_ids=None):
+    def forward(self, x, attention_mask=None, position_ids=None):
         S, B, _ = x.shape
 
         # Store normalized input for gating (query-dependent)
@@ -236,13 +239,24 @@ class GatedAttention(nn.Module):
             q = self.q_norm(q)
             k = self.k_norm(k)
 
-        # Compute attention
+        # Compute attention with proper padding mask
+        B_local, H, S_q, D = q.shape
+
+        # Build key-padding mask if attention_mask provided
+        # attention_mask is [B, S] with 1 for real tokens, 0 for padding
+        attn_mask = None
+        if attention_mask is not None:
+            # Convert to additive mask: [B, 1, 1, S]
+            # 0 for real tokens, -inf for padding
+            key_padding_mask = attention_mask.float()
+            key_padding_mask = (1.0 - key_padding_mask) * torch.finfo(q.dtype).min
+            attn_mask = key_padding_mask.unsqueeze(1).unsqueeze(1)
+
         if self.use_sdpa:
-            # Simply use causal masking - SDPA will handle it efficiently
-            # Padding is handled by the loss function (ignoring -100 labels)
+            # SDPA with both causal and padding masks
             out = F.scaled_dot_product_attention(
                 q, k, v,
-                attn_mask=None,  # Let SDPA handle causal mask internally
+                attn_mask=attn_mask,  # Padding mask (if any)
                 dropout_p=self.attn_dropout.p if self.training else 0.0,
                 is_causal=True  # Always causal for GPT
             )
@@ -252,6 +266,10 @@ class GatedAttention(nn.Module):
             # Apply causal mask
             causal_mask = torch.triu(torch.ones(S, S, device=x.device), diagonal=1).bool()
             scores.masked_fill_(causal_mask, float('-inf'))
+
+            # Apply padding mask if provided
+            if attn_mask is not None:
+                scores = scores + attn_mask
 
             attn = F.softmax(scores, dim=-1)
             attn = self.attn_dropout(attn)
@@ -327,7 +345,6 @@ class GatedTransformerBlock(nn.Module):
     def __init__(self, config: GatedConfig, layer_idx: int = 0):
         super().__init__()
         self.layer_idx = layer_idx
-        self.norm_position = config.norm_position
 
         # Normalization layers
         if config.use_rmsnorm:
@@ -345,11 +362,11 @@ class GatedTransformerBlock(nn.Module):
 
         self.dropout = nn.Dropout(config.dropout)
 
-    def forward(self, x, position_ids=None):
+    def forward(self, x, attention_mask=None, position_ids=None):
         # Pre-norm attention
         residual = x
         x = self.norm1(x)
-        x = self.attn(x, position_ids)
+        x = self.attn(x, attention_mask, position_ids)
         x = residual + self.dropout(x)
 
         # Pre-norm MLP
@@ -418,12 +435,9 @@ class GatedGPT2Model(nn.Module):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if hasattr(module, 'bias') and module.bias is not None:
                 nn.init.zeros_(module.bias)
-        # Smaller init for large output layer (lm_head)
-        if isinstance(module, te.Linear) and hasattr(module, 'out_features'):
-            if module.out_features > 10000:
-                nn.init.normal_(module.weight, mean=0.0, std=0.002)
+        # Note: No special init for lm_head since weights are tied with embeddings
 
-    def forward(self, input_ids, position_ids=None, labels=None):
+    def forward(self, input_ids, attention_mask=None, position_ids=None, labels=None):
         B, S = input_ids.shape
         device = input_ids.device
 
@@ -441,11 +455,16 @@ class GatedGPT2Model(nn.Module):
         # Convert to [S, B, H] for TransformerEngine
         x = x.transpose(0, 1)
 
+        # Prepare attention mask if provided (for padding)
+        if attention_mask is not None:
+            # attention_mask is [B, S] with 1 for real tokens, 0 for padding
+            # Keep it in this format for now, will convert in attention layer
+            pass
+
         # Apply transformer with FP8
-        # Note: Padding is handled via labels=-100 in loss calculation
         with te.fp8_autocast(enabled=self.config.use_fp8, fp8_recipe=self.fp8_recipe):
             for block in self.blocks:
-                x = block(x, position_ids)
+                x = block(x, attention_mask, position_ids)
 
             x = self.ln_f(x)
 
@@ -496,11 +515,9 @@ def get_gated_gpt2_config(
         # Architecture
         mlp_type="swiglu",
         use_rmsnorm=True,
-        norm_position="pre",
 
         # Optimizations
         use_fused_qkv=True,
-        use_fused_mlp=False,
         use_pytorch_sdpa=True,
         use_fp8=True
     )
