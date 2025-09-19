@@ -48,6 +48,7 @@ class TrainingConfig:
     gradient_accumulation_steps: int = 16  # GA 16 for effective batch size of 512
     learning_rate: float = 6e-4  # Good for large effective batch size
     min_learning_rate: float = 6e-5  # Scaled proportionally
+    use_attention_mask: bool = False  # Whether to mask padding in attention (costs ~10% performance)
     weight_decay: float = 0.1
     adam_beta1: float = 0.9
     adam_beta2: float = 0.95
@@ -199,8 +200,10 @@ def train_step(model, batch, optimizer, scheduler, scaler, config):
 
     # Move batch to device
     input_ids = batch["input_ids"].to(config.device)
-    attention_mask = batch["attention_mask"].to(config.device)
     labels = batch["labels"].to(config.device)
+
+    # Only use attention mask if configured (costs ~10% performance)
+    attention_mask = batch["attention_mask"].to(config.device) if config.use_attention_mask else None
 
     # FP8 is handled by TransformerEngine inside the model
     # The model forward already uses: with te.fp8_autocast(enabled=self.config.use_fp8)
@@ -264,8 +267,8 @@ def evaluate(model, dataloader, config, num_eval_steps=50):
                 break
 
             input_ids = batch["input_ids"].to(config.device)
-            attention_mask = batch["attention_mask"].to(config.device)
             labels = batch["labels"].to(config.device)
+            attention_mask = batch["attention_mask"].to(config.device) if config.use_attention_mask else None
 
             # Forward pass - match training precision
             dtype = torch.bfloat16 if config.mixed_precision == "bf16" else torch.float16

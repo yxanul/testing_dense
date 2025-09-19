@@ -245,10 +245,11 @@ class GatedAttention(nn.Module):
         # Build key-padding mask if attention_mask provided
         # attention_mask is [B, S] with 1 for real tokens, 0 for padding
         attn_mask = None
-        if attention_mask is not None:
+        if attention_mask is not None and not torch.all(attention_mask):
+            # Only create mask if there's actual padding (optimization)
             # Convert to additive mask: [B, 1, 1, S]
-            # 0 for real tokens, -inf for padding
-            key_padding_mask = attention_mask.float()
+            # Use bfloat16 to match model dtype and avoid conversion overhead
+            key_padding_mask = attention_mask.to(q.dtype)
             key_padding_mask = (1.0 - key_padding_mask) * torch.finfo(q.dtype).min
             attn_mask = key_padding_mask.unsqueeze(1).unsqueeze(1)
 
