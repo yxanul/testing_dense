@@ -1,19 +1,17 @@
-import torch
-import transformer_engine.pytorch as te
-from transformer_engine.common import recipe
+import os
+os.environ.setdefault("NVTE_FLASH_ATTN","0")
+os.environ.setdefault("NVTE_FUSED_ATTN","1")
 
-torch.cuda.set_device(0)
+import torch, transformer_engine as te
+import transformer_engine.pytorch as te_pt
+print("torch:", torch.__version__, "cuda:", torch.version.cuda, "TE:", te.__version__)
 
-M, K, N = 64, 4096, 4096   # multiples of 32
-x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+# FP8 Linear smoke test – pick multiples of 32 for MXFP8
+M,K,N = 64, 4096, 4096
+x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+lin = te_pt.Linear(K, N, bias=False).to("cuda", dtype=torch.bfloat16)
 
-lin = te.Linear(K, N, bias=False)  # weights in BF16, executed in FP8 via autocast
-
-# Try classic FP8 (E4M3) first; on some setups it avoids unlucky cuBLASLt heuristics.
-fp8_recipe = recipe.DelayedScaling(margin=0, fp8_format=recipe.Format.E4M3)
-
-with te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):
+with te_pt.fp8_autocast(enabled=True):   # FP8 activations, BF16 weights
     y = lin(x)
     y.sum().backward()
-
-print("OK")
+print("FP8 TE Linear backward OK")
