@@ -43,10 +43,10 @@ class TrainingConfig:
     use_fp8: bool = True  # Enable FP8 compute via TransformerEngine
 
     # Training hyperparameters
-    batch_size: int = 16  # Batch size 16
+    batch_size: int = 32  # Batch size 32 for better GPU utilization
     sequence_length: int = 1024  # Block size 1024 (faster iterations)
-    gradient_accumulation_steps: int = 16  # GA 16 for effective batch size of 256
-    learning_rate: float = 6e-4  # Increased for large effective batch size
+    gradient_accumulation_steps: int = 16  # GA 16 for effective batch size of 512
+    learning_rate: float = 6e-4  # Good for large effective batch size
     min_learning_rate: float = 6e-5  # Scaled proportionally
     weight_decay: float = 0.1
     adam_beta1: float = 0.9
@@ -343,8 +343,8 @@ def parse_args():
                         help="Disable FP8")
 
     # Training arguments
-    parser.add_argument("--batch_size", type=int, default=16,
-                        help="Training batch size (default: 16)")
+    parser.add_argument("--batch_size", type=int, default=32,
+                        help="Training batch size (default: 32)")
     parser.add_argument("--sequence_length", type=int, default=1024,
                         help="Sequence length (default: 1024)")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=16,
@@ -540,6 +540,8 @@ def main():
     running_loss = 0
     grad_norms = []
     global_step = start_step  # Actual optimization steps (for WandB)
+    accumulated_time = 0  # Track time for full optimizer step
+    micro_step_times = []  # Track individual micro-step times
 
     for step in range(start_step, config.num_train_steps):
         # Get batch from generator
@@ -556,10 +558,18 @@ def main():
         loss, grad_norm = train_step(model, batch, optimizer, scheduler, scaler, config)
         step_time = time.time() - step_start
 
+        micro_step_times.append(step_time)
+        accumulated_time += step_time
+
         running_loss += loss
         if grad_norm is not None:
+            # Optimizer stepped, record metrics
             grad_norms.append(grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm)
             global_step += 1  # Increment global step when optimizer actually steps
+
+            # Reset timing for next optimizer step
+            accumulated_time = 0
+            micro_step_times = []
 
             # Evaluation - ONLY when we just incremented to an eval step
             if global_step % (config.eval_interval // config.gradient_accumulation_steps) == 0:
@@ -587,8 +597,9 @@ def main():
             avg_loss = running_loss / config.log_interval
             avg_grad_norm = np.mean(grad_norms) if grad_norms else 0
             lr = scheduler.get_last_lr()[0]
-            # Tokens/sec is for a SINGLE step (not accumulated)
-            tokens_per_sec = (config.batch_size * config.sequence_length) / step_time
+            # Use average of recent micro-step times for tokens/sec
+            avg_micro_step_time = np.mean(micro_step_times) if micro_step_times else step_time
+            tokens_per_sec = (config.batch_size * config.sequence_length) / avg_micro_step_time
 
             log_dict = {
                 "train/loss": avg_loss,
@@ -596,7 +607,7 @@ def main():
                 "train/grad_norm": avg_grad_norm,
                 "train/learning_rate": lr,
                 "train/tokens_per_sec": tokens_per_sec,
-                "train/step_time": step_time,
+                "train/micro_step_time": avg_micro_step_time,  # Average time per micro-batch
                 "train/global_step": global_step,  # Use global step for WandB
                 "train/micro_step": step + 1
             }
