@@ -124,6 +124,12 @@ def rotate_half(x):
 
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None):
     """Apply RoPE to queries and keys."""
+    # Handle different dimensions for partial rotary
+    if q.shape[-1] != cos.shape[-1]:
+        # This shouldn't happen with the fix, but add safety check
+        cos = cos[..., :q.shape[-1]]
+        sin = sin[..., :q.shape[-1]]
+
     cos = cos.unsqueeze(1).unsqueeze(1)  # [seq_len, 1, 1, dim]
     sin = sin.unsqueeze(1).unsqueeze(1)
 
@@ -149,10 +155,13 @@ class ModernAttention(nn.Module):
 
         # Position embeddings
         self.position_embedding_type = config.position_embedding_type
+        self.partial_rotary_factor = config.partial_rotary_factor
+
         if self.position_embedding_type == "rope":
-            rope_dim = int(self.head_dim * config.partial_rotary_factor)
+            # For partial rotary, we only rotate part of the head dimensions
+            self.rope_dim = int(self.head_dim * config.partial_rotary_factor)
             self.rotary_emb = RotaryEmbedding(
-                rope_dim,
+                self.rope_dim,
                 max_position_embeddings=config.n_positions,
                 base=config.rope_theta,
             )
@@ -201,8 +210,23 @@ class ModernAttention(nn.Module):
 
         # Apply RoPE if configured
         if self.position_embedding_type == "rope":
-            cos, sin = self.rotary_emb(q, seq_len=S)
-            q, k = apply_rotary_pos_emb(q, k, cos, sin)
+            if self.partial_rotary_factor < 1.0:
+                # Partial rotary: only rotate part of the dimensions
+                q_rot = q[..., :self.rope_dim]
+                q_pass = q[..., self.rope_dim:]
+                k_rot = k[..., :self.rope_dim]
+                k_pass = k[..., self.rope_dim:]
+
+                cos, sin = self.rotary_emb(q_rot, seq_len=S)
+                q_rot, k_rot = apply_rotary_pos_emb(q_rot, k_rot, cos, sin)
+
+                # Concatenate rotated and non-rotated parts
+                q = torch.cat([q_rot, q_pass], dim=-1)
+                k = torch.cat([k_rot, k_pass], dim=-1)
+            else:
+                # Full rotary
+                cos, sin = self.rotary_emb(q, seq_len=S)
+                q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
         # QK Normalization (for training stability)
         if self.use_qk_norm:
