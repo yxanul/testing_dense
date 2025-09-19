@@ -44,7 +44,7 @@ from transformer_engine.common.recipe import DelayedScaling
 # -----------------------------
 @dataclass
 class GPT2Config:
-    vocab_size: int = 50257
+    vocab_size: int = 50264
     n_positions: int = 1024
     n_embd: int = 768          # GPT-2 small
     n_layer: int = 12
