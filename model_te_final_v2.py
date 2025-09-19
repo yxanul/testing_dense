@@ -24,7 +24,7 @@ class FinalConfig:
     vocab_size: int = 32768  # Power of 2, better for consumer GPUs
     n_positions: int = 2048
     n_embd: int = 768
-    n_layer: int = 24
+    n_layer: int = 12
     n_head: int = 12
     n_kv_head: Optional[int] = None  # For GQA (set to n_head//4 for 4:1)
 
@@ -333,7 +333,7 @@ class FinalGPT2Model(nn.Module):
 def get_gpt2_small_config():
     """GPT-2 Small (124M) optimized config."""
     return FinalConfig(
-        n_layer=12,
+        n_layer=24,
         n_embd=768,
         n_head=12,
         n_kv_head=3,  # GQA 4:1 (12 heads -> 3 KV heads)
