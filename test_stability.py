@@ -18,8 +18,8 @@ print("-" * 50)
 configs = [
     ("E4M3 margin=0", DelayedScaling(margin=0, fp8_format=Format.E4M3)),
     ("E4M3 margin=1", DelayedScaling(margin=1, fp8_format=Format.E4M3)),
+    ("E4M3 margin=2", DelayedScaling(margin=2, fp8_format=Format.E4M3)),
     ("E4M3 amax=16", DelayedScaling(margin=0, fp8_format=Format.E4M3, amax_history_len=16)),
-    ("E5M2 margin=0", DelayedScaling(margin=0, fp8_format=Format.E5M2)),
     ("HYBRID default", DelayedScaling(fp8_format=Format.HYBRID)),
 ]
 

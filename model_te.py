@@ -207,6 +207,8 @@ class GPT2TEModel(nn.Module):
 if __name__ == "__main__":
     import sys
 
+    torch.manual_seed(42)  # For reproducibility
+    torch.cuda.manual_seed(42)
     torch.backends.cuda.matmul.allow_tf32 = True
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
