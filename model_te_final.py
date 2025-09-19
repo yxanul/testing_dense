@@ -368,6 +368,88 @@ def get_gpt2_large_config():
     )
 
 
+def benchmark_with_proper_warmup(config, batch_size=8, seq_len=512, warmup_iters=50, bench_iters=50, profile_memory=True):
+    """Benchmark with proper warmup for FP8 to stabilize."""
+    import time
+    device = "cuda"
+
+    model = FinalGPT2Model(config).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+
+    # Check if FP8 is actually enabled
+    if config.use_fp8:
+        print(f"  FP8 enabled: {config.use_fp8}")
+        print(f"  FP8 recipe: {model.fp8_recipe}")
+        # Check if any module has FP8 metadata
+        for name, module in model.named_modules():
+            if hasattr(module, 'fp8_meta'):
+                print(f"  Found FP8 metadata in: {name}")
+                break
+        else:
+            print("  WARNING: No FP8 metadata found in any module!")
+
+    # Prepare data
+    input_ids = torch.randint(0, config.vocab_size, (batch_size, seq_len), device=device)
+    labels = torch.randint(0, config.vocab_size, (batch_size, seq_len), device=device)
+
+    # Memory before
+    if profile_memory:
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.synchronize()
+        mem_before = torch.cuda.memory_allocated() / 1024 / 1024
+
+    print(f"Warming up for {warmup_iters} iterations...")
+    # Warmup phase - let FP8 statistics stabilize
+    for i in range(warmup_iters):
+        optimizer.zero_grad()
+        logits, loss = model(input_ids, labels=labels)
+        loss.backward()
+        optimizer.step()
+
+        if (i + 1) % 10 == 0:
+            print(f"  Warmup {i+1}/{warmup_iters} - Loss: {loss.item():.4f}")
+
+    # Memory after warmup
+    if profile_memory:
+        torch.cuda.synchronize()
+        mem_after_warmup = torch.cuda.max_memory_allocated() / 1024 / 1024
+        print(f"  Memory usage: {mem_after_warmup:.1f} MB (peak)")
+
+    print(f"Benchmarking for {bench_iters} iterations...")
+    # Benchmark phase
+    torch.cuda.synchronize()
+    times = []
+
+    for _ in range(bench_iters):
+        torch.cuda.synchronize()
+        start = time.perf_counter()
+
+        optimizer.zero_grad()
+        logits, loss = model(input_ids, labels=labels)
+        loss.backward()
+        optimizer.step()
+
+        torch.cuda.synchronize()
+        times.append(time.perf_counter() - start)
+
+    # Calculate metrics
+    avg_time = sum(times) / len(times)
+    tokens_per_sec = (batch_size * seq_len) / avg_time
+    ms_per_iter = avg_time * 1000
+
+    # Final memory
+    if profile_memory:
+        torch.cuda.synchronize()
+        peak_memory = torch.cuda.max_memory_allocated() / 1024 / 1024
+
+    return {
+        'tokens_per_sec': tokens_per_sec,
+        'ms_per_iter': ms_per_iter,
+        'final_loss': loss.item(),
+        'peak_memory_mb': peak_memory if profile_memory else None
+    }
+
+
 if __name__ == "__main__":
     import time
 
@@ -387,39 +469,37 @@ if __name__ == "__main__":
     print("❌ NO torch.compile (slower with FP8)")
     print("=" * 80)
 
-    # Test the model
-    config = get_gpt2_small_config()
-    model = FinalGPT2Model(config).to(device)
+    # Compare FP8 vs BF16 with proper warmup
+    print("\nComparing FP8 vs BF16 with proper warmup:")
+    print("-" * 60)
 
-    # Count parameters
-    n_params = sum(p.numel() for p in model.parameters())
-    print(f"\nModel parameters: {n_params/1e6:.1f}M")
-
-    # Benchmark
     B, S = 8, 512
-    x = torch.randint(0, config.vocab_size, (B, S), device=device)
-    y = torch.randint(0, config.vocab_size, (B, S), device=device)
 
-    # Warmup
-    for _ in range(3):
-        logits, loss = model(x, labels=y)
-        loss.backward()
+    # Test BF16 (no FP8)
+    print("\n1. BF16 (no FP8):")
+    config_bf16 = get_gpt2_small_config()
+    config_bf16.use_fp8 = False
+    results_bf16 = benchmark_with_proper_warmup(config_bf16, B, S, warmup_iters=20, bench_iters=50)
+    print(f"  Tokens/sec: {results_bf16['tokens_per_sec']:,.0f}")
+    print(f"  ms/iter: {results_bf16['ms_per_iter']:.2f}")
 
-    # Time
-    torch.cuda.synchronize()
-    start = time.perf_counter()
+    # Test FP8 with short warmup
+    print("\n2. FP8 (20 iter warmup):")
+    config_fp8_short = get_gpt2_small_config()
+    config_fp8_short.use_fp8 = True
+    results_fp8_short = benchmark_with_proper_warmup(config_fp8_short, B, S, warmup_iters=20, bench_iters=50)
+    print(f"  Tokens/sec: {results_fp8_short['tokens_per_sec']:,.0f}")
+    print(f"  ms/iter: {results_fp8_short['ms_per_iter']:.2f}")
+    print(f"  vs BF16: {results_fp8_short['tokens_per_sec']/results_bf16['tokens_per_sec']:.2f}x")
 
-    for _ in range(10):
-        logits, loss = model(x, labels=y)
-        loss.backward()
-
-    torch.cuda.synchronize()
-    elapsed = (time.perf_counter() - start) * 100  # ms per iter
-
-    print(f"\nPerformance:")
-    print(f"  Time per iteration: {elapsed:.2f} ms")
-    print(f"  Throughput: {B * S / (elapsed/1000):.0f} tokens/sec")
-    print(f"  Final loss: {loss.item():.4f}")
+    # Test FP8 with longer warmup
+    print("\n3. FP8 (100 iter warmup):")
+    config_fp8_long = get_gpt2_small_config()
+    config_fp8_long.use_fp8 = True
+    results_fp8_long = benchmark_with_proper_warmup(config_fp8_long, B, S, warmup_iters=100, bench_iters=50)
+    print(f"  Tokens/sec: {results_fp8_long['tokens_per_sec']:,.0f}")
+    print(f"  ms/iter: {results_fp8_long['ms_per_iter']:.2f}")
+    print(f"  vs BF16: {results_fp8_long['tokens_per_sec']/results_bf16['tokens_per_sec']:.2f}x")
 
     print("\n" + "=" * 80)
     print("This is the FINAL PRODUCTION MODEL based on all benchmarks!")

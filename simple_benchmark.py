@@ -18,8 +18,9 @@ def benchmark_tokens_per_second():
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print()
 
-    # Configuration
+    # Configuration (with optimized vocab_size)
     config = FinalConfig(
+        vocab_size=32768,  # Power of 2 - better for consumer GPUs
         n_layer=12,
         n_head=12,
         n_kv_head=4,  # GQA 4:1 ratio
