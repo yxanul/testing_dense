@@ -40,6 +40,11 @@ class FinalConfig:
     ffn_hidden_size: Optional[int] = None
     mlp_type: str = "swiglu"  # Better than vanilla, but NO fusion
 
+    # Sliding window attention
+    use_sliding_window: bool = False  # Enable sliding window attention
+    sliding_window_size: int = 512  # Window size for local attention
+    sliding_window_layers: Optional[list] = None  # Which layers use sliding window
+
     # Optimizations (based on benchmarks)
     use_fused_qkv: bool = True   # ✅ 1.84x speedup
     use_fused_mlp: bool = False  # ❌ Actually slower!
@@ -50,6 +55,11 @@ class FinalConfig:
         if self.n_kv_head is None:
             # Default to GQA 4:1 (KV heads = n_head // 4)
             self.n_kv_head = max(1, self.n_head // 4)
+
+        # Default sliding window layers (alternating pattern for efficiency)
+        if self.use_sliding_window and self.sliding_window_layers is None:
+            # Use sliding window on every other layer (odd layers)
+            self.sliding_window_layers = [i for i in range(self.n_layer) if i % 2 == 1]
 
         if self.ffn_hidden_size is None:
             if self.mlp_type in ["swiglu", "geglu"]:
@@ -65,15 +75,27 @@ class FinalConfig:
 
 
 class FinalAttention(nn.Module):
-    """Optimized attention with fused QKV and PyTorch SDPA."""
+    """Optimized attention with fused QKV and PyTorch SDPA.
 
-    def __init__(self, config: FinalConfig):
+    Supports both full attention and sliding window attention.
+    """
+
+    def __init__(self, config: FinalConfig, layer_idx: int = 0):
         super().__init__()
         self.hidden_size = config.n_embd
         self.n_head = config.n_head
         self.n_kv_head = config.n_kv_head
         self.head_dim = self.hidden_size // self.n_head
         self.n_rep = self.n_head // self.n_kv_head
+        self.layer_idx = layer_idx
+
+        # Sliding window configuration
+        self.use_sliding_window = (
+            config.use_sliding_window and
+            config.sliding_window_layers and
+            layer_idx in config.sliding_window_layers
+        )
+        self.window_size = config.sliding_window_size if self.use_sliding_window else None
 
         # Fused QKV projection (proven 1.84x faster)
         if config.use_fused_qkv:
@@ -128,17 +150,32 @@ class FinalAttention(nn.Module):
         v = v.permute(1, 2, 0, 3)
 
         if self.use_sdpa:
-            # PyTorch SDPA (10x faster!)
-            out = F.scaled_dot_product_attention(
-                q, k, v,
-                dropout_p=self.attn_dropout.p if self.training else 0.0,
-                is_causal=True
-            )
+            if self.use_sliding_window:
+                # Create sliding window mask
+                attn_mask = self._create_sliding_window_mask(S, x.device)
+                # Use SDPA with custom mask
+                out = F.scaled_dot_product_attention(
+                    q, k, v,
+                    attn_mask=attn_mask,
+                    dropout_p=self.attn_dropout.p if self.training else 0.0,
+                    is_causal=False  # We handle causality in our mask
+                )
+            else:
+                # Full causal attention (standard)
+                out = F.scaled_dot_product_attention(
+                    q, k, v,
+                    dropout_p=self.attn_dropout.p if self.training else 0.0,
+                    is_causal=True
+                )
         else:
             # Manual attention (fallback)
             scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-            mask = torch.triu(torch.ones(S, S, device=x.device), diagonal=1).bool()
-            scores.masked_fill_(mask, float('-inf'))
+            if self.use_sliding_window:
+                mask = self._create_sliding_window_mask(S, x.device, for_scores=True)
+                scores = scores + mask
+            else:
+                mask = torch.triu(torch.ones(S, S, device=x.device), diagonal=1).bool()
+                scores.masked_fill_(mask, float('-inf'))
             attn = F.softmax(scores, dim=-1)
             attn = self.attn_dropout(attn)
             out = torch.matmul(attn, v)
@@ -148,6 +185,30 @@ class FinalAttention(nn.Module):
         out = self.out_proj(out)
 
         return out
+
+    def _create_sliding_window_mask(self, seq_len, device, for_scores=False):
+        """Create a sliding window attention mask.
+
+        The mask allows each position to attend to:
+        1. All positions up to window_size positions before it (local context)
+        2. Nothing after it (causal)
+        """
+        # Create causal mask first
+        mask = torch.triu(torch.ones(seq_len, seq_len, device=device), diagonal=1)
+
+        # Add sliding window constraint
+        for i in range(seq_len):
+            # Each position can only attend to window_size positions before it
+            if i > self.window_size:
+                mask[i, :i - self.window_size] = 1
+
+        if for_scores:
+            # Convert to additive mask for scores
+            mask = mask.masked_fill(mask.bool(), float('-inf'))
+            return mask
+        else:
+            # Convert to boolean mask for SDPA
+            return mask.bool()
 
 
 class FinalMLP(nn.Module):
@@ -192,8 +253,9 @@ class FinalMLP(nn.Module):
 class FinalTransformerBlock(nn.Module):
     """Final optimized transformer block based on all benchmarks."""
 
-    def __init__(self, config: FinalConfig):
+    def __init__(self, config: FinalConfig, layer_idx: int = 0):
         super().__init__()
+        self.layer_idx = layer_idx
 
         # Normalization - MUST use te.LayerNorm/te.RMSNorm for FP8!
         if config.use_rmsnorm:
@@ -203,8 +265,8 @@ class FinalTransformerBlock(nn.Module):
             self.norm1 = te.LayerNorm(config.n_embd, eps=config.layernorm_epsilon)
             self.norm2 = te.LayerNorm(config.n_embd, eps=config.layernorm_epsilon)
 
-        # Attention with fused QKV
-        self.attn = FinalAttention(config)
+        # Attention with fused QKV (pass layer index for sliding window)
+        self.attn = FinalAttention(config, layer_idx)
 
         # MLP without fusion
         self.mlp = FinalMLP(config)
@@ -247,10 +309,10 @@ class FinalGPT2Model(nn.Module):
         self.wpe = nn.Embedding(config.n_positions, config.n_embd)
         self.drop = nn.Dropout(config.dropout)
 
-        # Transformer blocks
+        # Transformer blocks (pass layer index for sliding window)
         self.blocks = nn.ModuleList([
-            FinalTransformerBlock(config)
-            for _ in range(config.n_layer)
+            FinalTransformerBlock(config, layer_idx=i)
+            for i in range(config.n_layer)
         ])
 
         # Final layer norm - MUST use te.LayerNorm/te.RMSNorm for FP8!
@@ -335,13 +397,22 @@ def get_gpt2_small_config():
     return FinalConfig(
         n_layer=12,
         n_embd=768,
-        n_head=16,
-        n_kv_head=2,  # GQA 4:1 (12 heads -> 3 KV heads)
+        n_head=12,  # Fixed back to 12 heads
+        n_kv_head=3,  # GQA 4:1 (12 heads -> 3 KV heads)
         mlp_type="swiglu",
         use_fused_qkv=True,
         use_fused_mlp=False,  # Important: fusion is slower!
         use_rmsnorm=True,  # Use te.RMSNorm for FP8 compatibility
     )
+
+
+def get_sliding_window_config():
+    """Config with sliding window attention for memory efficiency."""
+    config = get_gpt2_small_config()
+    config.use_sliding_window = True
+    config.sliding_window_size = 512  # Each token attends to 512 previous tokens
+    config.sliding_window_layers = [1, 3, 5, 7, 9, 11]  # Odd layers use sliding window
+    return config
 
 
 def get_gpt2_medium_config():
@@ -497,23 +568,28 @@ def benchmark_with_proper_warmup(config, batch_size=8, seq_len=512, warmup_iters
     }
 
 
-def benchmark_large_scale():
-    """Test FP8 with large batch/sequence where it should excel."""
+def benchmark_sliding_window():
+    """Compare sliding window attention vs full attention."""
     print("\n" + "=" * 80)
-    print("LARGE SCALE FP8 BENCHMARK")
-    print("Testing with large batch/sequence (where FP8 should excel)")
+    print("SLIDING WINDOW ATTENTION BENCHMARK")
+    print("Comparing memory and speed: Sliding Window vs Full Attention")
     print("=" * 80)
 
-    config = get_gpt2_small_config()
+    # Get configs
+    config_full = get_gpt2_small_config()
+    config_sliding = get_sliding_window_config()
 
-    # Test configurations: (batch_size, seq_len, grad_acc_steps)
-    # Focus on larger batches / GA as requested
+    print(f"\nSliding window config:")
+    print(f"  Window size: {config_sliding.sliding_window_size}")
+    print(f"  Layers with sliding window: {config_sliding.sliding_window_layers}")
+    print(f"  Layers with full attention: {[i for i in range(config_sliding.n_layer) if i not in config_sliding.sliding_window_layers]}")
+
+    # Test configurations for sliding window
     test_configs = [
-        (16, 1024, 8),   # 16 BA, 8 GA, 1024 seq (effective BS=128)
-        #(16, 1024, 16),  # 16 BA, 16 GA, 1024 seq (effective BS=256)
-        #(24, 1024, 1),   # 24 BA, 1 GA, 1024 seq
-        #(48, 512, 2),   # 48 BA, 2 GA, 512 seq
-        #(64, 512, 2),  # 64 BA, 2 GA, 512 seq
+        (8, 512, 1),     # Small
+        (8, 1024, 1),    # Medium
+        (8, 2048, 1),    # Long sequence (where sliding window helps)
+        (12, 2048, 1),   # Large batch + long seq
     ]
 
     results = []
@@ -526,27 +602,28 @@ def benchmark_large_scale():
         print(f"  Effective batch: {effective_batch}, Total tokens/iter: {total_tokens:,}")
 
         try:
-            # Test BF16
-            print("  Testing BF16...")
-            config.use_fp8 = False
-            bf16_results = benchmark_with_proper_warmup(
-                config, batch_size, seq_len,
+            # Test Full Attention
+            print("  Testing Full Attention...")
+            config_full.use_fp8 = True  # Use FP8 for both
+            full_results = benchmark_with_proper_warmup(
+                config_full, batch_size, seq_len,
                 warmup_iters=10, bench_iters=20,
                 gradient_accumulation_steps=grad_acc,
-                profile_memory=False
+                profile_memory=True
             )
 
-            # Test FP8
-            print("  Testing FP8...")
-            config.use_fp8 = True
-            fp8_results = benchmark_with_proper_warmup(
-                config, batch_size, seq_len,
+            # Test Sliding Window
+            print("  Testing Sliding Window...")
+            config_sliding.use_fp8 = True
+            sliding_results = benchmark_with_proper_warmup(
+                config_sliding, batch_size, seq_len,
                 warmup_iters=10, bench_iters=20,
                 gradient_accumulation_steps=grad_acc,
-                profile_memory=False
+                profile_memory=True
             )
 
-            speedup = fp8_results['tokens_per_sec'] / bf16_results['tokens_per_sec']
+            speedup = sliding_results['tokens_per_sec'] / full_results['tokens_per_sec']
+            memory_ratio = sliding_results['peak_memory_mb'] / full_results['peak_memory_mb']
 
             results.append({
                 'batch_size': batch_size,
@@ -554,53 +631,70 @@ def benchmark_large_scale():
                 'grad_acc': grad_acc,
                 'effective_batch': effective_batch,
                 'total_tokens': total_tokens,
-                'bf16_tps': bf16_results['tokens_per_sec'],
-                'fp8_tps': fp8_results['tokens_per_sec'],
-                'speedup': speedup
+                'full_tps': full_results['tokens_per_sec'],
+                'sliding_tps': sliding_results['tokens_per_sec'],
+                'full_memory': full_results['peak_memory_mb'],
+                'sliding_memory': sliding_results['peak_memory_mb'],
+                'speedup': speedup,
+                'memory_ratio': memory_ratio
             })
 
-            print(f"  BF16: {bf16_results['tokens_per_sec']:,.0f} tok/s")
-            print(f"  FP8:  {fp8_results['tokens_per_sec']:,.0f} tok/s")
-            print(f"  Speedup: {speedup:.3f}x")
+            print(f"  Full Attention:    {full_results['tokens_per_sec']:,.0f} tok/s, {full_results['peak_memory_mb']:.0f} MB")
+            print(f"  Sliding Window:    {sliding_results['tokens_per_sec']:,.0f} tok/s, {sliding_results['peak_memory_mb']:.0f} MB")
+            print(f"  Speed ratio:       {speedup:.3f}x")
+            print(f"  Memory ratio:      {memory_ratio:.3f}x")
 
         except Exception as e:
             print(f"  Failed: {e}")
 
     # Summary
     print("\n" + "=" * 80)
-    print("SUMMARY: FP8 Speedup vs Scale")
+    print("SUMMARY: Sliding Window vs Full Attention")
     print("=" * 80)
-    print(f"{'BS':<4} {'Seq':<6} {'GA':<4} {'EffBS':<6} {'Tokens':<10} {'BF16 tok/s':<12} {'FP8 tok/s':<12} {'Speedup':<8}")
+    print(f"{'BS':<4} {'Seq':<6} {'Full tok/s':<12} {'Slide tok/s':<12} {'Speed':<8} {'Full MB':<10} {'Slide MB':<10} {'Mem':<8}")
     print("-" * 80)
 
     for r in results:
-        print(f"{r['batch_size']:<4} {r['seq_len']:<6} {r['grad_acc']:<4} "
-              f"{r['effective_batch']:<6} {r['total_tokens']:<10,} "
-              f"{r['bf16_tps']:<12,.0f} {r['fp8_tps']:<12,.0f} "
-              f"{r['speedup']:<8.3f}x")
+        print(f"{r['batch_size']:<4} {r['seq_len']:<6} "
+              f"{r['full_tps']:<12,.0f} {r['sliding_tps']:<12,.0f} "
+              f"{r['speedup']:<8.3f}x "
+              f"{r['full_memory']:<10.0f} {r['sliding_memory']:<10.0f} "
+              f"{r['memory_ratio']:<8.3f}x")
 
     # Analysis
     if results:
-        small_scale = [r for r in results if r['total_tokens'] < 10000][0] if any(r['total_tokens'] < 10000 for r in results) else results[0]
-        large_scale = [r for r in results if r['total_tokens'] > 100000][0] if any(r['total_tokens'] > 100000 for r in results) else results[-1]
+        avg_speedup = sum(r['speedup'] for r in results) / len(results)
+        avg_memory = sum(r['memory_ratio'] for r in results) / len(results)
+
+        # Find best case for long sequences
+        long_seq_results = [r for r in results if r['seq_len'] >= 2048]
 
         print("\n" + "=" * 80)
         print("ANALYSIS:")
         print("-" * 80)
-        print(f"Small scale ({small_scale['total_tokens']:,} tokens): {small_scale['speedup']:.3f}x speedup")
-        print(f"Large scale ({large_scale['total_tokens']:,} tokens): {large_scale['speedup']:.3f}x speedup")
+        print(f"Average speed ratio: {avg_speedup:.3f}x")
+        print(f"Average memory ratio: {avg_memory:.3f}x")
 
-        if large_scale['speedup'] > small_scale['speedup'] * 1.1:
-            print("\n✅ FP8 shows better speedup at larger scale!")
-            print("   This confirms FP8 benefits increase with scale.")
-            print("\nRECOMMENDATIONS for RTX 5090:")
-            print("1. Use FP8 with large batches (BS ≥ 12) and long sequences (Seq ≥ 2048)")
-            print("2. Avoid gradient accumulation with small batches (it hurts performance)")
-            print("3. For best results: BS=12, Seq=2048, no gradient accumulation")
-            print("4. Expected speedup: 1.2-1.24x over BF16")
+        if long_seq_results:
+            best_long = max(long_seq_results, key=lambda x: x['speedup'])
+            print(f"\nBest for long sequences (Seq={best_long['seq_len']}):")
+            print(f"  Speed: {best_long['speedup']:.3f}x")
+            print(f"  Memory: {best_long['memory_ratio']:.3f}x")
+
+        if avg_speedup > 1.05:
+            print("\n✅ Sliding window attention provides speedup!")
+            print("   Benefits increase with sequence length.")
+        elif avg_speedup > 0.95:
+            print("\n➡️ Sliding window attention has similar speed to full attention.")
+            print("   But provides memory savings for long sequences.")
         else:
-            print("\n⚠️ FP8 speedup doesn't improve with scale.")
-            print("   Your GPU may not have native FP8 support.")
+            print("\n⚠️ Sliding window attention is slower than full attention.")
+            print("   This may be due to mask creation overhead.")
+
+        if avg_memory < 0.9:
+            print("\n✅ Significant memory savings with sliding window!")
+        else:
+            print("\n⚠️ Limited memory savings - window size may be too large.")
 
 
 if __name__ == "__main__":
@@ -666,8 +760,8 @@ if __name__ == "__main__":
     else:
         print(f"  vs BF16 memory: {results_fp8_long['peak_memory_mb']/results_bf16['peak_memory_mb']:.2f}x")
 
-    # Run large scale benchmark
-    benchmark_large_scale()
+    # Run sliding window benchmark
+    benchmark_sliding_window()
 
     print("\n" + "=" * 80)
     print("IMPORTANT NOTES:")
