@@ -151,15 +151,31 @@ class FinalAttention(nn.Module):
 
         if self.use_sdpa:
             if self.use_sliding_window:
-                # Create sliding window mask
-                attn_mask = self._create_sliding_window_mask(S, x.device)
-                # Use SDPA with custom mask
-                out = F.scaled_dot_product_attention(
-                    q, k, v,
-                    attn_mask=attn_mask,
-                    dropout_p=self.attn_dropout.p if self.training else 0.0,
-                    is_causal=False  # We handle causality in our mask
-                )
+                # Try to use Flash Attention's native sliding window if available
+                try:
+                    # Flash Attention 2 with sliding window (if available)
+                    with torch.backends.cuda.sdp_kernel(
+                        enable_flash=True,
+                        enable_math=False,
+                        enable_mem_efficient=False
+                    ):
+                        # Create efficient sliding window mask
+                        attn_mask = self._create_sliding_window_mask(S, x.device)
+                        out = F.scaled_dot_product_attention(
+                            q, k, v,
+                            attn_mask=attn_mask,
+                            dropout_p=self.attn_dropout.p if self.training else 0.0,
+                            is_causal=False  # We handle causality in our mask
+                        )
+                except:
+                    # Fallback to regular SDPA with mask
+                    attn_mask = self._create_sliding_window_mask(S, x.device)
+                    out = F.scaled_dot_product_attention(
+                        q, k, v,
+                        attn_mask=attn_mask,
+                        dropout_p=self.attn_dropout.p if self.training else 0.0,
+                        is_causal=False
+                    )
             else:
                 # Full causal attention (standard)
                 out = F.scaled_dot_product_attention(
@@ -187,28 +203,31 @@ class FinalAttention(nn.Module):
         return out
 
     def _create_sliding_window_mask(self, seq_len, device, for_scores=False):
-        """Create a sliding window attention mask.
+        """Create a sliding window attention mask (vectorized for efficiency).
 
         The mask allows each position to attend to:
         1. All positions up to window_size positions before it (local context)
         2. Nothing after it (causal)
         """
-        # Create causal mask first
-        mask = torch.triu(torch.ones(seq_len, seq_len, device=device), diagonal=1)
+        # Vectorized mask creation
+        row_indices = torch.arange(seq_len, device=device).unsqueeze(1)
+        col_indices = torch.arange(seq_len, device=device).unsqueeze(0)
 
-        # Add sliding window constraint
-        for i in range(seq_len):
-            # Each position can only attend to window_size positions before it
-            if i > self.window_size:
-                mask[i, :i - self.window_size] = 1
+        # Causal mask: can't attend to future
+        causal_mask = row_indices >= col_indices
+
+        # Window mask: can only attend within window
+        window_mask = row_indices - col_indices <= self.window_size
+
+        # Combine both constraints
+        mask = causal_mask & window_mask
 
         if for_scores:
             # Convert to additive mask for scores
-            mask = mask.masked_fill(mask.bool(), float('-inf'))
-            return mask
+            return torch.where(mask, 0.0, float('-inf'))
         else:
-            # Convert to boolean mask for SDPA
-            return mask.bool()
+            # Return inverted boolean mask for SDPA (True means masked out)
+            return ~mask
 
 
 class FinalMLP(nn.Module):
