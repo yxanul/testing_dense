@@ -334,7 +334,7 @@ def get_gpt2_small_config():
     """GPT-2 Small (124M) optimized config."""
     return FinalConfig(
         n_layer=24,
-        n_embd=1024,
+        n_embd=1200,
         n_head=12,
         n_kv_head=3,  # GQA 4:1 (12 heads -> 3 KV heads)
         mlp_type="swiglu",
