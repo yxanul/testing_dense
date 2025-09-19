@@ -369,13 +369,23 @@ def get_gpt2_large_config():
     )
 
 
-def benchmark_with_proper_warmup(config, batch_size=8, seq_len=512, warmup_iters=50, bench_iters=50, profile_memory=True):
-    """Benchmark with proper warmup for FP8 to stabilize."""
+def benchmark_with_proper_warmup(config, batch_size=8, seq_len=512, warmup_iters=50, bench_iters=50,
+                                profile_memory=True, gradient_accumulation_steps=1):
+    """Benchmark with proper warmup for FP8 to stabilize.
+
+    Args:
+        gradient_accumulation_steps: Number of steps to accumulate gradients
+                                   (simulates larger effective batch size)
+    """
     import time
     device = "cuda"
 
     model = FinalGPT2Model(config).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+
+    effective_batch_size = batch_size * gradient_accumulation_steps
+    if gradient_accumulation_steps > 1:
+        print(f"  Effective batch size: {effective_batch_size} (BS={batch_size}, GA={gradient_accumulation_steps})")
 
     # Check if FP8 is actually enabled
     if config.use_fp8:
