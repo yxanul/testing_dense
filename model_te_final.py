@@ -120,9 +120,9 @@ class FinalAttention(nn.Module):
             v = self.v_proj(x)
 
         # Reshape for attention
-        q = q.view(S, B, self.n_head, self.head_dim)
-        k = k.view(S, B, self.n_kv_head, self.head_dim)
-        v = v.view(S, B, self.n_kv_head, self.head_dim)
+        q = q.reshape(S, B, self.n_head, self.head_dim)
+        k = k.reshape(S, B, self.n_kv_head, self.head_dim)
+        v = v.reshape(S, B, self.n_kv_head, self.head_dim)
 
         # GQA: repeat KV heads if needed
         if self.n_kv_head < self.n_head:
