@@ -333,8 +333,8 @@ class FinalGPT2Model(nn.Module):
 def get_gpt2_small_config():
     """GPT-2 Small (124M) optimized config."""
     return FinalConfig(
-        n_layer=24,
-        n_embd=1024,
+        n_layer=12,
+        n_embd=768,
         n_head=16,
         n_kv_head=2,  # GQA 4:1 (12 heads -> 3 KV heads)
         mlp_type="swiglu",
