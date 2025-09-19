@@ -276,8 +276,21 @@ class FinalGPT2Model(nn.Module):
         # FP8 recipe (HYBRID for best gradient precision)
         self.fp8_recipe = DelayedScaling(
             margin=0,
-            fp8_format=Format.HYBRID  # E4M3 fwd, E5M2 bwd
+            fp8_format=Format.HYBRID,  # E4M3 fwd, E5M2 bwd
+            amax_history_len=1024,
+            amax_compute_algo="most_recent"
         )
+
+        # Initialize FP8 metadata for all te.Linear modules
+        if config.use_fp8:
+            # Prepare FP8 calibration by initializing metadata
+            for module in self.modules():
+                if isinstance(module, te.Linear):
+                    # This ensures FP8 metadata is properly initialized
+                    with te.fp8_autocast(enabled=True, fp8_recipe=self.fp8_recipe):
+                        dummy_input = torch.randn(1, module.in_features,
+                                                 device="cuda", dtype=torch.bfloat16)
+                        _ = module(dummy_input)
 
     def _init_weights(self, module):
         if isinstance(module, (nn.Embedding, nn.Linear)):
@@ -380,13 +393,23 @@ def benchmark_with_proper_warmup(config, batch_size=8, seq_len=512, warmup_iters
     if config.use_fp8:
         print(f"  FP8 enabled: {config.use_fp8}")
         print(f"  FP8 recipe: {model.fp8_recipe}")
-        # Check if any module has FP8 metadata
+        # Check FP8 metadata in all te.Linear modules
+        fp8_count = 0
         for name, module in model.named_modules():
-            if hasattr(module, 'fp8_meta'):
-                print(f"  Found FP8 metadata in: {name}")
-                break
+            if isinstance(module, te.Linear) and hasattr(module, 'fp8_meta'):
+                fp8_count += 1
+                if fp8_count <= 3:  # Show first 3 for brevity
+                    print(f"  Found FP8 metadata in: {name}")
+        print(f"  Total modules with FP8 metadata: {fp8_count}")
+
+        # Check actual FP8 parameters
+        for name, module in model.named_modules():
+            if isinstance(module, te.Linear):
+                if hasattr(module, 'weight_fp8'):
+                    print(f"  FP8 weight found in: {name}")
+                    break
         else:
-            print("  WARNING: No FP8 metadata found in any module!")
+            print("  WARNING: No FP8 weights found! FP8 might not be active.")
 
     # Prepare data
     input_ids = torch.randint(0, config.vocab_size, (batch_size, seq_len), device=device)
@@ -482,6 +505,7 @@ if __name__ == "__main__":
     results_bf16 = benchmark_with_proper_warmup(config_bf16, B, S, warmup_iters=20, bench_iters=50)
     print(f"  Tokens/sec: {results_bf16['tokens_per_sec']:,.0f}")
     print(f"  ms/iter: {results_bf16['ms_per_iter']:.2f}")
+    print(f"  Memory: {results_bf16['peak_memory_mb']:.1f} MB")
 
     # Test FP8 with short warmup
     print("\n2. FP8 (20 iter warmup):")
@@ -490,7 +514,9 @@ if __name__ == "__main__":
     results_fp8_short = benchmark_with_proper_warmup(config_fp8_short, B, S, warmup_iters=20, bench_iters=50)
     print(f"  Tokens/sec: {results_fp8_short['tokens_per_sec']:,.0f}")
     print(f"  ms/iter: {results_fp8_short['ms_per_iter']:.2f}")
-    print(f"  vs BF16: {results_fp8_short['tokens_per_sec']/results_bf16['tokens_per_sec']:.2f}x")
+    print(f"  Memory: {results_fp8_short['peak_memory_mb']:.1f} MB")
+    print(f"  vs BF16 speed: {results_fp8_short['tokens_per_sec']/results_bf16['tokens_per_sec']:.2f}x")
+    print(f"  vs BF16 memory: {results_fp8_short['peak_memory_mb']/results_bf16['peak_memory_mb']:.2f}x")
 
     # Test FP8 with longer warmup
     print("\n3. FP8 (100 iter warmup):")
@@ -499,7 +525,9 @@ if __name__ == "__main__":
     results_fp8_long = benchmark_with_proper_warmup(config_fp8_long, B, S, warmup_iters=100, bench_iters=50)
     print(f"  Tokens/sec: {results_fp8_long['tokens_per_sec']:,.0f}")
     print(f"  ms/iter: {results_fp8_long['ms_per_iter']:.2f}")
-    print(f"  vs BF16: {results_fp8_long['tokens_per_sec']/results_bf16['tokens_per_sec']:.2f}x")
+    print(f"  Memory: {results_fp8_long['peak_memory_mb']:.1f} MB")
+    print(f"  vs BF16 speed: {results_fp8_long['tokens_per_sec']/results_bf16['tokens_per_sec']:.2f}x")
+    print(f"  vs BF16 memory: {results_fp8_long['peak_memory_mb']/results_bf16['peak_memory_mb']:.2f}x")
 
     print("\n" + "=" * 80)
     print("This is the FINAL PRODUCTION MODEL based on all benchmarks!")
