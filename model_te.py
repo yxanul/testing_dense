@@ -131,7 +131,11 @@ class GPT2TEModel(nn.Module):
         # TE Linear exposes weight/bias like nn.Linear
         linear_types = (te.Linear,)
         if isinstance(module, linear_types):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            # Smaller std for output layer to prevent overflow
+            if hasattr(module, 'out_features') and module.out_features > 10000:
+                nn.init.normal_(module.weight, mean=0.0, std=0.002)
+            else:
+                nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
 
