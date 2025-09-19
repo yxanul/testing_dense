@@ -34,7 +34,7 @@ class FinalConfig:
 
     # Layer configuration
     layernorm_epsilon: float = 1e-5
-    use_rmsnorm: bool = False  # RMSNorm is faster but less stable
+    use_rmsnorm: bool = False  # Use te.RMSNorm (required for FP8 flow)
 
     # MLP configuration
     ffn_hidden_size: Optional[int] = None
@@ -60,15 +60,7 @@ class FinalConfig:
                 self.ffn_hidden_size = 4 * self.n_embd
 
 
-class RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6):
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
-
-    def forward(self, x):
-        norm = torch.sqrt(torch.mean(x ** 2, dim=-1, keepdim=True) + self.eps)
-        return x / norm * self.weight
+# Removed custom RMSNorm - use te.RMSNorm for FP8 compatibility
 
 
 class FinalAttention(nn.Module):
@@ -202,10 +194,10 @@ class FinalTransformerBlock(nn.Module):
     def __init__(self, config: FinalConfig):
         super().__init__()
 
-        # Normalization
+        # Normalization - MUST use te.LayerNorm/te.RMSNorm for FP8!
         if config.use_rmsnorm:
-            self.norm1 = RMSNorm(config.n_embd, config.layernorm_epsilon)
-            self.norm2 = RMSNorm(config.n_embd, config.layernorm_epsilon)
+            self.norm1 = te.RMSNorm(config.n_embd, eps=config.layernorm_epsilon)
+            self.norm2 = te.RMSNorm(config.n_embd, eps=config.layernorm_epsilon)
         else:
             self.norm1 = te.LayerNorm(config.n_embd, eps=config.layernorm_epsilon)
             self.norm2 = te.LayerNorm(config.n_embd, eps=config.layernorm_epsilon)
@@ -260,9 +252,9 @@ class FinalGPT2Model(nn.Module):
             for _ in range(config.n_layer)
         ])
 
-        # Final layer norm
+        # Final layer norm - MUST use te.LayerNorm/te.RMSNorm for FP8!
         if config.use_rmsnorm:
-            self.ln_f = RMSNorm(config.n_embd, config.layernorm_epsilon)
+            self.ln_f = te.RMSNorm(config.n_embd, eps=config.layernorm_epsilon)
         else:
             self.ln_f = te.LayerNorm(config.n_embd, eps=config.layernorm_epsilon)
 
@@ -345,6 +337,7 @@ def get_gpt2_small_config():
         mlp_type="swiglu",
         use_fused_qkv=True,
         use_fused_mlp=False,  # Important: fusion is slower!
+        use_rmsnorm=True,  # Use te.RMSNorm for FP8 compatibility
     )
 
 
