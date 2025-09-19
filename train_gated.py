@@ -43,9 +43,9 @@ class TrainingConfig:
     use_fp8: bool = True  # Enable FP8 compute via TransformerEngine
 
     # Training hyperparameters
-    batch_size: int = 12  # Optimal for RTX 5090
-    sequence_length: int = 2048
-    gradient_accumulation_steps: int = 1
+    batch_size: int = 16  # Batch size 16
+    sequence_length: int = 1024  # Block size 1024 (faster iterations)
+    gradient_accumulation_steps: int = 16  # GA 16 for effective batch size of 256
     learning_rate: float = 3e-4
     min_learning_rate: float = 3e-5
     weight_decay: float = 0.1
@@ -469,9 +469,8 @@ def main():
         "fp8_format": "HYBRID (E4M3 fwd, E5M2 bwd)" if config.use_fp8 else "None"
     })
 
-    # Convert to bfloat16 if specified
-    if config.mixed_precision == "bf16":
-        model = model.to(dtype=torch.bfloat16)
+    # Model dtype is already set in model init (to bfloat16)
+    # No need to convert again here
 
     # Compile model if requested
     if config.compile_model:
@@ -534,9 +533,10 @@ def main():
         print("  Expected: ~185K tokens/sec (single forward pass)")
         print("  With backward pass: ~130K tokens/sec is normal")
 
-    # No need to call iter() on generator
+    # Track both micro-steps and actual optimization steps
     running_loss = 0
     grad_norms = []
+    global_step = start_step  # Actual optimization steps (for WandB)
 
     for step in range(start_step, config.num_train_steps):
         # Get batch from generator
@@ -556,8 +556,9 @@ def main():
         running_loss += loss
         if grad_norm is not None:
             grad_norms.append(grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm)
+            global_step += 1  # Increment global step when optimizer actually steps
 
-        # Logging
+        # Logging (every N micro-steps)
         if (step + 1) % config.log_interval == 0:
             avg_loss = running_loss / config.log_interval
             avg_grad_norm = np.mean(grad_norms) if grad_norms else 0
@@ -572,11 +573,13 @@ def main():
                 "train/learning_rate": lr,
                 "train/tokens_per_sec": tokens_per_sec,
                 "train/step_time": step_time,
-                "train/step": step
+                "train/global_step": global_step,  # Use global step for WandB
+                "train/micro_step": step + 1
             }
-            wandb.log(log_dict)
+            wandb.log(log_dict, step=global_step)  # Log at the correct global step
 
-            print(f"Step {step+1}/{config.num_train_steps} | "
+            # Show both micro-steps and global steps in output
+            print(f"Step {global_step}/{config.num_train_steps//config.gradient_accumulation_steps} (micro {step+1}) | "
                   f"Loss: {avg_loss:.4f} | "
                   f"PPL: {math.exp(avg_loss) if avg_loss < 10 else float('inf'):.2f} | "
                   f"LR: {lr:.2e} | "
@@ -585,22 +588,21 @@ def main():
             running_loss = 0
             grad_norms = []
 
-        # Evaluation
-        if (step + 1) % config.eval_interval == 0:
-            print(f"\nEvaluating at step {step+1}...")
+        # Evaluation (based on global steps)
+        if global_step > 0 and global_step % (config.eval_interval // config.gradient_accumulation_steps) == 0:
+            print(f"\nEvaluating at global step {global_step}...")
             eval_loss, eval_ppl = evaluate(model, eval_dataloader, config)
 
             eval_dict = {
                 "eval/loss": eval_loss,
-                "eval/perplexity": eval_ppl,
-                "eval/step": step
+                "eval/perplexity": eval_ppl
             }
-            wandb.log(eval_dict)
+            wandb.log(eval_dict, step=global_step)
 
             print(f"Eval Loss: {eval_loss:.4f} | Eval PPL: {eval_ppl:.2f}\n")
 
-        # Save checkpoint
-        if (step + 1) % config.save_interval == 0:
+        # Save checkpoint (based on global steps)
+        if global_step > 0 and global_step % (config.save_interval // config.gradient_accumulation_steps) == 0:
             metrics = {
                 "train_loss": running_loss / config.log_interval if running_loss > 0 else 0,
                 "step": step + 1
@@ -630,5 +632,11 @@ def main():
 if __name__ == "__main__":
     # Set environment variables for better performance
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"
+    os.environ["CUDA_LAUNCH_BLOCKING"] = "0"  # Async CUDA operations
+
+    # Enable TF32 for better Ampere/Ada performance
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True  # Auto-tune for best kernels
 
     main()
