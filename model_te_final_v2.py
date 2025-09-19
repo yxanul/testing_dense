@@ -509,7 +509,7 @@ def benchmark_large_scale():
     # Test configurations: (batch_size, seq_len, grad_acc_steps)
     # Focus on larger batches / GA as requested
     test_configs = [
-        (8, 4096, 1),   # 16 BA, 4 GA, 4096 seq
+        (8, 2048, 1),   # 16 BA, 4 GA, 4096 seq
         #(16, 1024, 16),  # 16 BA, 16 GA, 1024 seq (effective BS=256)
         #(24, 1024, 1),   # 24 BA, 1 GA, 1024 seq
         #(48, 512, 2),   # 48 BA, 2 GA, 512 seq
