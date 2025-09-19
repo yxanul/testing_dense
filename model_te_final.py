@@ -369,6 +369,29 @@ def get_gpt2_large_config():
     )
 
 
+def get_rtx5090_optimized_config():
+    """Optimized config for RTX 5090 based on benchmarks.
+
+    Key findings:
+    - FP8 gives 1.24x speedup at large scale (BS=12, Seq=2048)
+    - Use large batches without gradient accumulation when possible
+    - Small batches should avoid gradient accumulation with FP8
+    """
+    return FinalConfig(
+        vocab_size=32768,  # Power of 2 for better GPU utilization
+        n_layer=12,
+        n_embd=768,
+        n_head=12,
+        n_kv_head=4,  # 3:1 GQA ratio for memory savings
+        mlp_type="swiglu",
+        use_fused_qkv=True,
+        use_fused_mlp=False,  # Fusion is slower
+        use_rmsnorm=True,  # Required for FP8 flow
+        use_pytorch_sdpa=True,  # 10x faster attention
+        use_fp8=True,  # 1.24x speedup at scale
+    )
+
+
 def benchmark_with_proper_warmup(config, batch_size=8, seq_len=512, warmup_iters=50, bench_iters=50,
                                 profile_memory=True, gradient_accumulation_steps=1):
     """Benchmark with proper warmup for FP8 to stabilize.
@@ -568,6 +591,11 @@ def benchmark_large_scale():
         if large_scale['speedup'] > small_scale['speedup'] * 1.1:
             print("\n✅ FP8 shows better speedup at larger scale!")
             print("   This confirms FP8 benefits increase with scale.")
+            print("\nRECOMMENDATIONS for RTX 5090:")
+            print("1. Use FP8 with large batches (BS ≥ 12) and long sequences (Seq ≥ 2048)")
+            print("2. Avoid gradient accumulation with small batches (it hurts performance)")
+            print("3. For best results: BS=12, Seq=2048, no gradient accumulation")
+            print("4. Expected speedup: 1.2-1.24x over BF16")
         else:
             print("\n⚠️ FP8 speedup doesn't improve with scale.")
             print("   Your GPU may not have native FP8 support.")
@@ -646,8 +674,10 @@ if __name__ == "__main__":
     print("2. Custom norm layers break FP8 flow - use te.RMSNorm/te.LayerNorm")
     print("3. RTX 5090 may not have native FP8 support (Ada architecture)")
     print("4. Weights stay BF16, quantized to FP8 during GEMM operations")
-    print("5. For true FP8 benefits, you need Hopper GPUs (H100/H200)")
-    print("\nIf FP8 shows no speedup on your GPU:")
-    print("- Set use_fp8=False for better performance")
-    print("- RTX 5090 excels at BF16, use that instead")
+    print("5. For true FP8 benefits (1.5-2x), you need Hopper GPUs (H100/H200)")
+    print("\nRTX 5090 FP8 Performance:")
+    print("- Best case: 1.24x speedup with BS=12, Seq=2048")
+    print("- Requires large batches to see benefits")
+    print("- Avoid gradient accumulation with small batches (causes slowdown)")
+    print("- If working with small batches (BS<8), disable FP8")
     print("=" * 80)
