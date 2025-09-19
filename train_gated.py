@@ -198,20 +198,20 @@ def train_step(model, batch, optimizer, scheduler, scaler, config):
 
     # Move batch to device
     input_ids = batch["input_ids"].to(config.device)
-    attention_mask = batch["attention_mask"].to(config.device)
     labels = batch["labels"].to(config.device)
+    # Note: attention_mask not needed - padding handled by labels=-100
 
     # FP8 is handled by TransformerEngine inside the model
     # The model forward already uses: with te.fp8_autocast(enabled=self.config.use_fp8)
     # We just need bf16 for the outer context
     if config.mixed_precision == "bf16":
         with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-            logits, loss = model(input_ids, attention_mask=attention_mask, labels=labels)
+            logits, loss = model(input_ids, labels=labels)
     elif config.mixed_precision == "fp16":
         with torch.cuda.amp.autocast(dtype=torch.float16):
-            logits, loss = model(input_ids, attention_mask=attention_mask, labels=labels)
+            logits, loss = model(input_ids, labels=labels)
     else:
-        logits, loss = model(input_ids, attention_mask=attention_mask, labels=labels)
+        logits, loss = model(input_ids, labels=labels)
 
     # Scale loss for gradient accumulation
     loss = loss / config.gradient_accumulation_steps
@@ -263,12 +263,11 @@ def evaluate(model, dataloader, config, num_eval_steps=50):
                 break
 
             input_ids = batch["input_ids"].to(config.device)
-            attention_mask = batch["attention_mask"].to(config.device)
             labels = batch["labels"].to(config.device)
 
             # Forward pass
             with torch.cuda.amp.autocast(enabled=config.mixed_precision != "fp32"):
-                logits, loss = model(input_ids, attention_mask=attention_mask, labels=labels)
+                logits, loss = model(input_ids, labels=labels)
 
             # Accumulate loss
             num_tokens = (labels != -100).sum().item()
@@ -563,9 +562,8 @@ def main():
             avg_loss = running_loss / config.log_interval
             avg_grad_norm = np.mean(grad_norms) if grad_norms else 0
             lr = scheduler.get_last_lr()[0]
-            # FIXED: Use effective batch size for correct tokens/sec calculation
-            effective_batch_size = config.batch_size * config.gradient_accumulation_steps
-            tokens_per_sec = (effective_batch_size * config.sequence_length) / step_time
+            # Tokens/sec is for a SINGLE step (not accumulated)
+            tokens_per_sec = (config.batch_size * config.sequence_length) / step_time
 
             log_dict = {
                 "train/loss": avg_loss,

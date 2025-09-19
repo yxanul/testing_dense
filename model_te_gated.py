@@ -187,7 +187,7 @@ class GatedAttention(nn.Module):
         self.attn_dropout = nn.Dropout(config.attn_dropout)
         self.use_sdpa = config.use_pytorch_sdpa
 
-    def forward(self, x, attention_mask=None, position_ids=None):
+    def forward(self, x, position_ids=None):
         S, B, _ = x.shape
 
         # Store normalized input for gating (query-dependent)
@@ -238,24 +238,20 @@ class GatedAttention(nn.Module):
 
         # Compute attention
         if self.use_sdpa:
-            # CRITICAL FIX: Always apply causal masking for autoregressive models
-            # The attention_mask is for padding, not causality!
+            # Simply use causal masking - SDPA will handle it efficiently
+            # Padding is handled by the loss function (ignoring -100 labels)
             out = F.scaled_dot_product_attention(
                 q, k, v,
-                attn_mask=attention_mask,  # This is padding mask (if provided)
+                attn_mask=None,  # Let SDPA handle causal mask internally
                 dropout_p=self.attn_dropout.p if self.training else 0.0,
-                is_causal=True  # ALWAYS causal for GPT-style models
+                is_causal=True  # Always causal for GPT
             )
         else:
             scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
 
-            # Always apply causal mask first
+            # Apply causal mask
             causal_mask = torch.triu(torch.ones(S, S, device=x.device), diagonal=1).bool()
             scores.masked_fill_(causal_mask, float('-inf'))
-
-            # Then apply padding mask if provided
-            if attention_mask is not None:
-                scores = scores + attention_mask
 
             attn = F.softmax(scores, dim=-1)
             attn = self.attn_dropout(attn)
@@ -349,11 +345,11 @@ class GatedTransformerBlock(nn.Module):
 
         self.dropout = nn.Dropout(config.dropout)
 
-    def forward(self, x, attention_mask=None, position_ids=None):
+    def forward(self, x, position_ids=None):
         # Pre-norm attention
         residual = x
         x = self.norm1(x)
-        x = self.attn(x, attention_mask, position_ids)
+        x = self.attn(x, position_ids)
         x = residual + self.dropout(x)
 
         # Pre-norm MLP
@@ -427,7 +423,7 @@ class GatedGPT2Model(nn.Module):
             if module.out_features > 10000:
                 nn.init.normal_(module.weight, mean=0.0, std=0.002)
 
-    def forward(self, input_ids, attention_mask=None, position_ids=None, labels=None):
+    def forward(self, input_ids, position_ids=None, labels=None):
         B, S = input_ids.shape
         device = input_ids.device
 
@@ -445,16 +441,11 @@ class GatedGPT2Model(nn.Module):
         # Convert to [S, B, H] for TransformerEngine
         x = x.transpose(0, 1)
 
-        # Prepare attention mask if needed
-        if attention_mask is not None:
-            # Convert to additive mask for attention
-            attention_mask = (1.0 - attention_mask) * -10000.0
-            attention_mask = attention_mask.unsqueeze(1).unsqueeze(1)
-
         # Apply transformer with FP8
+        # Note: Padding is handled via labels=-100 in loss calculation
         with te.fp8_autocast(enabled=self.config.use_fp8, fp8_recipe=self.fp8_recipe):
             for block in self.blocks:
-                x = block(x, attention_mask, position_ids)
+                x = block(x, position_ids)
 
             x = self.ln_f(x)
 
