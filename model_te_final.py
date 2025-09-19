@@ -318,8 +318,8 @@ class FinalGPT2Model(nn.Module):
         loss = None
         if labels is not None:
             loss = F.cross_entropy(
-                logits.view(-1, self.config.vocab_size),
-                labels.view(-1)
+                logits.reshape(-1, self.config.vocab_size),
+                labels.reshape(-1)
             )
 
         return logits, loss
