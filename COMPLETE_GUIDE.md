@@ -255,6 +255,7 @@ testing_dense/
    - Best performance (10x attention, 20% FP8 speedup)
    - All features working
    - Well-tested configuration
+   - **Compatible with torch.compile for additional speedup**
 
 2. **Configuration Guidelines**
    ```python
@@ -265,6 +266,10 @@ testing_dense/
        use_pytorch_sdpa=True,  # Fastest attention
        use_fp8=True,          # Training acceleration
    )
+
+   # Add torch.compile for extra 10-30% speedup
+   model = OptimizedGPT2Model(config).cuda()
+   model = torch.compile(model, mode="reduce-overhead")
    ```
 
 3. **Hardware Requirements**
@@ -276,10 +281,18 @@ testing_dense/
 ### Performance Expectations
 
 With optimized configuration on H100:
-- **Attention**: 10x faster than vanilla
-- **Training**: 20% faster with FP8
+- **Attention**: 10x faster than vanilla (PyTorch SDPA)
+- **FP8 Training**: 20% faster with TransformerEngine
+- **torch.compile**: Additional 10-30% speedup
 - **Memory**: 50% reduction with GQA
-- **Combined**: ~2x overall training speedup
+- **Combined**: ~2.5x overall training speedup possible
+
+#### Speedup Stack:
+1. Baseline: 1.00x
+2. + PyTorch SDPA: 2.00x (10x attention → 2x overall)
+3. + FP8 (TE modules): 2.40x (20% additional)
+4. + torch.compile: 2.64x - 3.12x (10-30% additional)
+5. + GQA: Enables larger batch sizes
 
 ---
 

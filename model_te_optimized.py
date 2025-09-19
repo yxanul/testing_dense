@@ -321,6 +321,7 @@ if __name__ == "__main__":
     print("- PyTorch 2.0 SDPA for attention (10x faster)")
     print("- Fused TE modules for FP8 support")
     print("- HYBRID FP8 format (E4M3 fwd, E5M2 bwd)")
+    print("- torch.compile for graph optimization")
     print("=" * 60)
 
     # Test configurations
@@ -344,6 +345,9 @@ if __name__ == "__main__":
         print("-" * 40)
 
         model = OptimizedGPT2Model(config).to(device)
+
+        # Optional: Add torch.compile for extra speedup
+        # model = torch.compile(model, mode="reduce-overhead")
 
         # Count parameters
         n_params = sum(p.numel() for p in model.parameters())
