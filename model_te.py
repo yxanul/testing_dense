@@ -36,7 +36,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import transformer_engine.pytorch as te
-from transformer_engine.common.recipe import DelayedScaling, Format
+from transformer_engine.common.recipe import DelayedScaling, Format, MXFP8BlockScaling
 
 
 # -----------------------------
@@ -57,10 +57,9 @@ class GPT2Config:
     # TransformerEngine / precision knobs
     weights_dtype: torch.dtype = torch.bfloat16
     use_fp8: bool = True
-    # Force classic FP8 (no MXFP8) by default. You can still override via fp8_recipe.
-    # HYBRID = E4M3 for fwd, E5M2 for bwd/grad (works well on H100/Blackwell).
-    fp8_format: Format = Format.HYBRID
-    fp8_recipe: Optional[DelayedScaling] = None  # if None, we'll build one from fp8_format  # None => use default recipe
+    # Recipe type: "delayed_hybrid", "delayed_e4m3", "mxfp8"
+    recipe_type: str = "delayed_hybrid"
+    fp8_recipe: Optional[object] = None  # if None, we'll build one based on recipe_type
 
 
 # -----------------------------
@@ -103,9 +102,27 @@ class GPT2TEModel(nn.Module):
         if cfg.tie_embeddings:
             self.lm_head.weight = self.wte.weight  # type: ignore[attr-defined]
 
-        # FP8 recipe
-        # FP8 recipe: use classic FP8 (DelayedScaling) explicitly, NOT MXFP8.
-        self._fp8_recipe = cfg.fp8_recipe or DelayedScaling(fp8_format=cfg.fp8_format)
+        # FP8 recipe configuration
+        if cfg.fp8_recipe:
+            self._fp8_recipe = cfg.fp8_recipe
+        elif cfg.recipe_type == "delayed_hybrid":
+            # HYBRID: E4M3 during forward pass, E5M2 during backward pass
+            self._fp8_recipe = DelayedScaling(
+                fp8_format=Format.HYBRID,
+                amax_history_len=16,
+                amax_compute_algo="max"
+            )
+        elif cfg.recipe_type == "delayed_e4m3":
+            # E4M3 for both forward and backward (like test2.py)
+            self._fp8_recipe = DelayedScaling(
+                fp8_format=Format.E4M3,
+                margin=0
+            )
+        elif cfg.recipe_type == "mxfp8":
+            # MXFP8 block scaling with E4M3
+            self._fp8_recipe = MXFP8BlockScaling(fp8_format=Format.E4M3)
+        else:
+            raise ValueError(f"Unknown recipe_type: {cfg.recipe_type}")
 
     @staticmethod
     def _init_weights(module: nn.Module):
@@ -182,10 +199,16 @@ class GPT2TEModel(nn.Module):
 # Tiny test / demo
 # -----------------------------
 if __name__ == "__main__":
+    import sys
+
     torch.backends.cuda.matmul.allow_tf32 = True
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    cfg = GPT2Config()
+    # Allow recipe selection via command line
+    recipe_type = sys.argv[1] if len(sys.argv) > 1 else "delayed_hybrid"
+    print(f"Testing with recipe_type: {recipe_type}")
+
+    cfg = GPT2Config(recipe_type=recipe_type)
     model = GPT2TEModel(cfg).to(device)
 
     # Synthetic batch
