@@ -214,7 +214,13 @@ if __name__ == "__main__":
     recipe_type = sys.argv[1] if len(sys.argv) > 1 else "delayed_hybrid"
     print(f"Testing with recipe_type: {recipe_type}")
 
-    cfg = GPT2Config(recipe_type=recipe_type)
+    # Use smaller model for testing
+    cfg = GPT2Config(
+        recipe_type=recipe_type,
+        n_layer=2,  # Fewer layers for stability testing
+        n_head=12,
+        n_embd=768
+    )
     print(f"Using vocab_size={cfg.vocab_size} (divisible by 32: {cfg.vocab_size % 32 == 0})")
 
     model = GPT2TEModel(cfg).to(device)
