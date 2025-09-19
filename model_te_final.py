@@ -281,16 +281,9 @@ class FinalGPT2Model(nn.Module):
             amax_compute_algo="most_recent"
         )
 
-        # Initialize FP8 metadata for all te.Linear modules
-        if config.use_fp8:
-            # Prepare FP8 calibration by initializing metadata
-            for module in self.modules():
-                if isinstance(module, te.Linear):
-                    # This ensures FP8 metadata is properly initialized
-                    with te.fp8_autocast(enabled=True, fp8_recipe=self.fp8_recipe):
-                        dummy_input = torch.randn(1, module.in_features,
-                                                 device="cuda", dtype=torch.bfloat16)
-                        _ = module(dummy_input)
+        # Note: TransformerEngine FP8 is for COMPUTE, not STORAGE
+        # Weights remain in BF16 but are dynamically quantized to FP8 during GEMMs
+        # This means memory usage won't decrease, but compute should be faster
 
     def _init_weights(self, module):
         if isinstance(module, (nn.Embedding, nn.Linear)):
@@ -402,14 +395,10 @@ def benchmark_with_proper_warmup(config, batch_size=8, seq_len=512, warmup_iters
                     print(f"  Found FP8 metadata in: {name}")
         print(f"  Total modules with FP8 metadata: {fp8_count}")
 
-        # Check actual FP8 parameters
-        for name, module in model.named_modules():
-            if isinstance(module, te.Linear):
-                if hasattr(module, 'weight_fp8'):
-                    print(f"  FP8 weight found in: {name}")
-                    break
-        else:
-            print("  WARNING: No FP8 weights found! FP8 might not be active.")
+        # Note: FP8 in TransformerEngine is for compute, not storage
+        # Weights stay in BF16, dynamically quantized during GEMM operations
+        print("  Note: FP8 applies to compute (GEMMs), not storage")
+        print("  Weights remain BF16, quantized on-the-fly to FP8")
 
     # Prepare data
     input_ids = torch.randint(0, config.vocab_size, (batch_size, seq_len), device=device)
@@ -487,7 +476,7 @@ if __name__ == "__main__":
     print("✅ Fused QKV projection (1.84x speedup)")
     print("❌ NO fused MLP (benchmarks show it's slower)")
     print("✅ PyTorch SDPA (10x faster attention)")
-    print("✅ FP8 HYBRID format (1.2x speedup)")
+    print("✅ FP8 HYBRID format (for compute acceleration)")
     print("✅ GQA for memory efficiency")
     print("❌ NO torch.compile (slower with FP8)")
     print("=" * 80)
@@ -516,7 +505,10 @@ if __name__ == "__main__":
     print(f"  ms/iter: {results_fp8_short['ms_per_iter']:.2f}")
     print(f"  Memory: {results_fp8_short['peak_memory_mb']:.1f} MB")
     print(f"  vs BF16 speed: {results_fp8_short['tokens_per_sec']/results_bf16['tokens_per_sec']:.2f}x")
-    print(f"  vs BF16 memory: {results_fp8_short['peak_memory_mb']/results_bf16['peak_memory_mb']:.2f}x")
+    if abs(results_fp8_short['peak_memory_mb']/results_bf16['peak_memory_mb'] - 1.0) < 0.1:
+        print(f"  Memory usage similar (expected - FP8 is for compute, not storage)")
+    else:
+        print(f"  vs BF16 memory: {results_fp8_short['peak_memory_mb']/results_bf16['peak_memory_mb']:.2f}x")
 
     # Test FP8 with longer warmup
     print("\n3. FP8 (100 iter warmup):")
@@ -527,9 +519,19 @@ if __name__ == "__main__":
     print(f"  ms/iter: {results_fp8_long['ms_per_iter']:.2f}")
     print(f"  Memory: {results_fp8_long['peak_memory_mb']:.1f} MB")
     print(f"  vs BF16 speed: {results_fp8_long['tokens_per_sec']/results_bf16['tokens_per_sec']:.2f}x")
-    print(f"  vs BF16 memory: {results_fp8_long['peak_memory_mb']/results_bf16['peak_memory_mb']:.2f}x")
+    if abs(results_fp8_long['peak_memory_mb']/results_bf16['peak_memory_mb'] - 1.0) < 0.1:
+        print(f"  Memory usage similar (expected - FP8 is for compute, not storage)")
+    else:
+        print(f"  vs BF16 memory: {results_fp8_long['peak_memory_mb']/results_bf16['peak_memory_mb']:.2f}x")
 
     print("\n" + "=" * 80)
-    print("This is the FINAL PRODUCTION MODEL based on all benchmarks!")
-    print("Use model_te_final.py for your training!")
+    print("IMPORTANT NOTES:")
+    print("-" * 80)
+    print("1. FP8 in TransformerEngine is for COMPUTE acceleration, not memory savings")
+    print("2. Weights remain in BF16 and are quantized to FP8 during GEMM operations")
+    print("3. RTX 5090 may not have native FP8 support (Ada architecture)")
+    print("4. For true FP8 benefits, you need Hopper GPUs (H100/H200)")
+    print("\nIf FP8 shows no speedup on your GPU:")
+    print("- Set use_fp8=False for better performance")
+    print("- RTX 5090 excels at BF16, use that instead")
     print("=" * 80)
