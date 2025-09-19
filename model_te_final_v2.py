@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import transformer_engine.pytorch as te
-from transformer_engine.common.recipe import DelayedScaling, Format, MXFP8BlockScaling
+from transformer_engine.common.recipe import DelayedScaling, Format
 from dataclasses import dataclass
 from typing import Optional
 
@@ -46,12 +46,10 @@ class FinalConfig:
     use_pytorch_sdpa: bool = True  # ✅ 10x faster
     use_fp8: bool = True  # ✅ 1.2x speedup
 
-    # FP8 recipe selection for this module
-    use_mxfp8: bool = True  # If True, use MXFP8BlockScaling(E4M3); else HYBRID DelayedScaling
-
     def __post_init__(self):
         if self.n_kv_head is None:
-            self.n_kv_head = self.n_head
+            # Default to GQA 4:1 (KV heads = n_head // 4)
+            self.n_kv_head = max(1, self.n_head // 4)
 
         if self.ffn_hidden_size is None:
             if self.mlp_type in ["swiglu", "geglu"]:
@@ -263,21 +261,20 @@ class FinalGPT2Model(nn.Module):
 
         # Output projection
         self.lm_head = te.Linear(config.n_embd, config.vocab_size, bias=False)
+        # Weight tying: share embedding matrix with output projection
+        self.lm_head.weight = self.wte.weight  # weight tying
 
         # Initialize weights
         self.apply(self._init_weights)
         self.to(dtype=torch.bfloat16)
 
-        # FP8 recipe: MXFP8 (E4M3 everywhere) or HYBRID (E4M3 fwd, E5M2 bwd)
-        if self.config.use_mxfp8:
-            self.fp8_recipe = MXFP8BlockScaling(fp8_format=Format.E4M3)
-        else:
-            self.fp8_recipe = DelayedScaling(
-                margin=0,
-                fp8_format=Format.HYBRID,
-                amax_history_len=1024,
-                amax_compute_algo="most_recent"
-            )
+        # FP8 recipe (HYBRID for best gradient precision)
+        self.fp8_recipe = DelayedScaling(
+            margin=0,
+            fp8_format=Format.HYBRID,  # E4M3 fwd, E5M2 bwd
+            amax_history_len=1024,
+            amax_compute_algo="most_recent"
+        )
 
         # Note: TransformerEngine FP8 is for COMPUTE, not STORAGE
         # Weights remain in BF16 but are dynamically quantized to FP8 during GEMMs
@@ -339,7 +336,7 @@ def get_gpt2_small_config():
         n_layer=12,
         n_embd=768,
         n_head=12,
-        n_kv_head=12,  # No GQA for small model
+        n_kv_head=3,  # GQA 4:1 (12 heads -> 3 KV heads)
         mlp_type="swiglu",
         use_fused_qkv=True,
         use_fused_mlp=False,  # Important: fusion is slower!
@@ -388,7 +385,7 @@ def get_rtx5090_optimized_config():
         n_layer=12,
         n_embd=768,
         n_head=12,
-        n_kv_head=4,  # 3:1 GQA ratio for memory savings
+        n_kv_head=3,  # 4:1 GQA ratio for memory savings
         mlp_type="swiglu",
         use_fused_qkv=True,
         use_fused_mlp=False,  # Fusion is slower
