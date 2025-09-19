@@ -237,6 +237,9 @@ def train_step(model, batch, optimizer, scheduler, scaler, config):
         # Gradient clipping
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
 
+        # Check if gradients were clipped
+        grad_clipped = grad_norm > config.max_grad_norm
+
         if scaler is not None:
             scaler.step(optimizer)
             scaler.update()
@@ -247,8 +250,9 @@ def train_step(model, batch, optimizer, scheduler, scaler, config):
         optimizer.zero_grad(set_to_none=True)
     else:
         grad_norm = None
+        grad_clipped = False
 
-    return loss.item() * config.gradient_accumulation_steps, grad_norm
+    return loss.item() * config.gradient_accumulation_steps, grad_norm, grad_clipped
 
 
 def evaluate(model, dataloader, config, num_eval_steps=50):
@@ -562,6 +566,8 @@ def main():
     # Track both micro-steps and actual optimization steps
     running_loss = 0
     grad_norms = []
+    clipped_steps = 0  # Track how many steps had gradients clipped
+    total_optimizer_steps = 0  # Track total optimizer steps for clipping rate
     global_step = start_step  # Actual optimization steps (for WandB)
     accumulated_time = 0  # Track time for full optimizer step
     micro_step_times = []  # Track individual micro-step times
@@ -578,7 +584,7 @@ def main():
 
         # Training step
         step_start = time.time()
-        loss, grad_norm = train_step(model, batch, optimizer, scheduler, scaler, config)
+        loss, grad_norm, grad_clipped = train_step(model, batch, optimizer, scheduler, scaler, config)
         step_time = time.time() - step_start
 
         micro_step_times.append(step_time)
@@ -589,6 +595,11 @@ def main():
             # Optimizer stepped, record metrics
             grad_norms.append(grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm)
             global_step += 1  # Increment global step when optimizer actually steps
+            total_optimizer_steps += 1
+
+            # Track clipping
+            if grad_clipped:
+                clipped_steps += 1
 
             # Reset timing for next optimizer step
             accumulated_time = 0
@@ -624,10 +635,14 @@ def main():
             avg_micro_step_time = np.mean(micro_step_times) if micro_step_times else step_time
             tokens_per_sec = (config.batch_size * config.sequence_length) / avg_micro_step_time
 
+            # Calculate clipping rate
+            clipping_rate = (clipped_steps / total_optimizer_steps * 100) if total_optimizer_steps > 0 else 0
+
             log_dict = {
                 "train/loss": avg_loss,
                 "train/perplexity": math.exp(avg_loss) if avg_loss < 10 else float('inf'),
                 "train/grad_norm": avg_grad_norm,
+                "train/grad_clipped_rate": clipping_rate,  # Percentage of steps where gradients were clipped
                 "train/learning_rate": lr,
                 "train/tokens_per_sec": tokens_per_sec,
                 "train/micro_step_time": avg_micro_step_time,  # Average time per micro-batch
@@ -641,6 +656,7 @@ def main():
                   f"Loss: {avg_loss:.4f} | "
                   f"PPL: {math.exp(avg_loss) if avg_loss < 10 else float('inf'):.2f} | "
                   f"LR: {lr:.2e} | "
+                  f"Clip: {clipping_rate:.1f}% | "
                   f"Tokens/s: {tokens_per_sec:.0f}")
 
             running_loss = 0
