@@ -55,7 +55,7 @@ class TrainingConfig:
     max_grad_norm: float = 1.0
 
     # Scheduler
-    warmup_steps: int = 2000
+    warmup_steps: int = 1000
     lr_scheduler: str = "cosine"  # "cosine" or "linear"
 
     # Training duration
