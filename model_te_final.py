@@ -21,7 +21,7 @@ from typing import Optional
 @dataclass
 class FinalConfig:
     # Model architecture
-    vocab_size: int = 50304  # Must be divisible by 32 for FP8
+    vocab_size: int = 32768  # Power of 2, better for consumer GPUs
     n_positions: int = 2048
     n_embd: int = 768
     n_layer: int = 12
