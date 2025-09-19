@@ -431,17 +431,21 @@ def benchmark_with_proper_warmup(config, batch_size=8, seq_len=512, warmup_iters
         torch.cuda.synchronize()
         start = time.perf_counter()
 
-        optimizer.zero_grad()
-        logits, loss = model(input_ids, labels=labels)
-        loss.backward()
+        # Gradient accumulation
+        for micro_step in range(gradient_accumulation_steps):
+            logits, loss = model(input_ids, labels=labels)
+            loss = loss / gradient_accumulation_steps
+            loss.backward()
+
         optimizer.step()
+        optimizer.zero_grad()
 
         torch.cuda.synchronize()
         times.append(time.perf_counter() - start)
 
     # Calculate metrics
     avg_time = sum(times) / len(times)
-    tokens_per_sec = (batch_size * seq_len) / avg_time
+    tokens_per_sec = (batch_size * seq_len * gradient_accumulation_steps) / avg_time  # Effective throughput
     ms_per_iter = avg_time * 1000
 
     # Final memory
@@ -457,11 +461,114 @@ def benchmark_with_proper_warmup(config, batch_size=8, seq_len=512, warmup_iters
     }
 
 
+def benchmark_large_scale():
+    """Test FP8 with large batch/sequence where it should excel."""
+    print("\n" + "=" * 80)
+    print("LARGE SCALE FP8 BENCHMARK")
+    print("Testing with large batch/sequence (where FP8 should excel)")
+    print("=" * 80)
+
+    config = get_gpt2_small_config()
+
+    # Test configurations: (batch_size, seq_len, grad_acc_steps)
+    test_configs = [
+        (4, 512, 1),     # Small baseline
+        (8, 512, 1),     # Medium
+        (12, 512, 1),    # Large batch
+        (4, 2048, 1),    # Long sequence
+        (12, 2048, 1),   # Large batch + long seq
+        (4, 512, 12),    # Gradient accumulation (effective BS=48)
+        (12, 2048, 12),  # Maximum scale (effective BS=144)
+    ]
+
+    results = []
+
+    for batch_size, seq_len, grad_acc in test_configs:
+        effective_batch = batch_size * grad_acc
+        total_tokens = effective_batch * seq_len
+
+        print(f"\nConfig: BS={batch_size}, Seq={seq_len}, GradAcc={grad_acc}")
+        print(f"  Effective batch: {effective_batch}, Total tokens/iter: {total_tokens:,}")
+
+        try:
+            # Test BF16
+            print("  Testing BF16...")
+            config.use_fp8 = False
+            bf16_results = benchmark_with_proper_warmup(
+                config, batch_size, seq_len,
+                warmup_iters=10, bench_iters=20,
+                gradient_accumulation_steps=grad_acc,
+                profile_memory=False
+            )
+
+            # Test FP8
+            print("  Testing FP8...")
+            config.use_fp8 = True
+            fp8_results = benchmark_with_proper_warmup(
+                config, batch_size, seq_len,
+                warmup_iters=10, bench_iters=20,
+                gradient_accumulation_steps=grad_acc,
+                profile_memory=False
+            )
+
+            speedup = fp8_results['tokens_per_sec'] / bf16_results['tokens_per_sec']
+
+            results.append({
+                'batch_size': batch_size,
+                'seq_len': seq_len,
+                'grad_acc': grad_acc,
+                'effective_batch': effective_batch,
+                'total_tokens': total_tokens,
+                'bf16_tps': bf16_results['tokens_per_sec'],
+                'fp8_tps': fp8_results['tokens_per_sec'],
+                'speedup': speedup
+            })
+
+            print(f"  BF16: {bf16_results['tokens_per_sec']:,.0f} tok/s")
+            print(f"  FP8:  {fp8_results['tokens_per_sec']:,.0f} tok/s")
+            print(f"  Speedup: {speedup:.3f}x")
+
+        except Exception as e:
+            print(f"  Failed: {e}")
+
+    # Summary
+    print("\n" + "=" * 80)
+    print("SUMMARY: FP8 Speedup vs Scale")
+    print("=" * 80)
+    print(f"{'BS':<4} {'Seq':<6} {'GA':<4} {'EffBS':<6} {'Tokens':<10} {'BF16 tok/s':<12} {'FP8 tok/s':<12} {'Speedup':<8}")
+    print("-" * 80)
+
+    for r in results:
+        print(f"{r['batch_size']:<4} {r['seq_len']:<6} {r['grad_acc']:<4} "
+              f"{r['effective_batch']:<6} {r['total_tokens']:<10,} "
+              f"{r['bf16_tps']:<12,.0f} {r['fp8_tps']:<12,.0f} "
+              f"{r['speedup']:<8.3f}x")
+
+    # Analysis
+    if results:
+        small_scale = [r for r in results if r['total_tokens'] < 10000][0] if any(r['total_tokens'] < 10000 for r in results) else results[0]
+        large_scale = [r for r in results if r['total_tokens'] > 100000][0] if any(r['total_tokens'] > 100000 for r in results) else results[-1]
+
+        print("\n" + "=" * 80)
+        print("ANALYSIS:")
+        print("-" * 80)
+        print(f"Small scale ({small_scale['total_tokens']:,} tokens): {small_scale['speedup']:.3f}x speedup")
+        print(f"Large scale ({large_scale['total_tokens']:,} tokens): {large_scale['speedup']:.3f}x speedup")
+
+        if large_scale['speedup'] > small_scale['speedup'] * 1.1:
+            print("\n✅ FP8 shows better speedup at larger scale!")
+            print("   This confirms FP8 benefits increase with scale.")
+        else:
+            print("\n⚠️ FP8 speedup doesn't improve with scale.")
+            print("   Your GPU may not have native FP8 support.")
+
+
 if __name__ == "__main__":
     import time
 
     torch.manual_seed(42)
     torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
     device = "cuda"
 
     print("=" * 80)
@@ -518,6 +625,9 @@ if __name__ == "__main__":
         print(f"  Memory usage similar (expected - FP8 is for compute, not storage)")
     else:
         print(f"  vs BF16 memory: {results_fp8_long['peak_memory_mb']/results_bf16['peak_memory_mb']:.2f}x")
+
+    # Run large scale benchmark
+    benchmark_large_scale()
 
     print("\n" + "=" * 80)
     print("IMPORTANT NOTES:")
