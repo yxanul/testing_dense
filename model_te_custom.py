@@ -72,7 +72,7 @@ class CustomTransformerBlock(nn.Module):
 
 
 class GPT2CustomModel(nn.Module):
-    def __init__(self, vocab_size=50264, n_positions=1024, n_embd=768,
+    def __init__(self, vocab_size=50304, n_positions=1024, n_embd=768,
                  n_layer=12, n_head=12, dropout=0.1):
         super().__init__()
 
@@ -134,12 +134,13 @@ if __name__ == "__main__":
 
     # Test forward/backward
     B, S = 2, 128
-    x = torch.randint(0, 50264, (B, S), device=device)
-    y = torch.randint(0, 50264, (B, S), device=device)
+    vocab_size = 50304
+    x = torch.randint(0, vocab_size, (B, S), device=device)
+    y = torch.randint(0, vocab_size, (B, S), device=device)
 
     # Forward with FP8
     logits = model(x, use_fp8=True)
-    loss = F.cross_entropy(logits.reshape(-1, 50264), y.reshape(-1))
+    loss = F.cross_entropy(logits.reshape(-1, vocab_size), y.reshape(-1))
 
     # Backward
     opt = torch.optim.AdamW(model.parameters(), lr=3e-4)
