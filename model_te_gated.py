@@ -40,7 +40,7 @@ class GatedConfig:
 
     # Layer configuration
     layernorm_epsilon: float = 1e-5
-    use_rmsnorm: bool = True  # Use te.RMSNorm for FP8 compatibility
+    use_rmsnorm: bool = True  # MUST use te.RMSNorm for FP8 compatibility
     norm_position: str = "pre"  # "pre" or "post"
 
     # MLP configuration
@@ -238,19 +238,25 @@ class GatedAttention(nn.Module):
 
         # Compute attention
         if self.use_sdpa:
+            # CRITICAL FIX: Always apply causal masking for autoregressive models
+            # The attention_mask is for padding, not causality!
             out = F.scaled_dot_product_attention(
                 q, k, v,
-                attn_mask=attention_mask,
+                attn_mask=attention_mask,  # This is padding mask (if provided)
                 dropout_p=self.attn_dropout.p if self.training else 0.0,
-                is_causal=True if attention_mask is None else False
+                is_causal=True  # ALWAYS causal for GPT-style models
             )
         else:
             scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+
+            # Always apply causal mask first
+            causal_mask = torch.triu(torch.ones(S, S, device=x.device), diagonal=1).bool()
+            scores.masked_fill_(causal_mask, float('-inf'))
+
+            # Then apply padding mask if provided
             if attention_mask is not None:
                 scores = scores + attention_mask
-            else:
-                mask = torch.triu(torch.ones(S, S, device=x.device), diagonal=1).bool()
-                scores.masked_fill_(mask, float('-inf'))
+
             attn = F.softmax(scores, dim=-1)
             attn = self.attn_dropout(attn)
             out = torch.matmul(attn, v)
@@ -396,8 +402,10 @@ class GatedGPT2Model(nn.Module):
 
         # Initialize weights
         self.apply(self._init_weights)
+        # Convert to bfloat16 for better stability with FP8
+        self.to(dtype=torch.bfloat16)
 
-        # FP8 recipe
+        # FP8 recipe (HYBRID for best gradient precision)
         self.fp8_recipe = DelayedScaling(
             margin=0,
             fp8_format=Format.HYBRID,
@@ -406,14 +414,18 @@ class GatedGPT2Model(nn.Module):
         )
 
     def _init_weights(self, module):
-        if isinstance(module, (nn.Linear, nn.Embedding)):
-            module.weight.data.normal_(mean=0.0, std=0.02)
+        if isinstance(module, (nn.Embedding, nn.Linear)):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if isinstance(module, nn.Linear) and module.bias is not None:
-                module.bias.data.zero_()
+                nn.init.zeros_(module.bias)
         elif isinstance(module, te.Linear):
-            module.weight.data.normal_(mean=0.0, std=0.02)
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if hasattr(module, 'bias') and module.bias is not None:
-                module.bias.data.zero_()
+                nn.init.zeros_(module.bias)
+        # Smaller init for large output layer (lm_head)
+        if isinstance(module, te.Linear) and hasattr(module, 'out_features'):
+            if module.out_features > 10000:
+                nn.init.normal_(module.weight, mean=0.0, std=0.002)
 
     def forward(self, input_ids, attention_mask=None, position_ids=None, labels=None):
         B, S = input_ids.shape

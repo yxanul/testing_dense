@@ -481,12 +481,14 @@ def main():
 
     # Create optimizer
     print("Creating optimizer...")
+    # Use fused AdamW when available (requires CUDA, provides ~10% speedup)
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=config.learning_rate,
         betas=(config.adam_beta1, config.adam_beta2),
         eps=config.adam_epsilon,
-        weight_decay=config.weight_decay
+        weight_decay=config.weight_decay,
+        fused=torch.cuda.is_available()  # Enable fused optimizer on CUDA
     )
     optimizer.step_count = 0  # Track steps for gradient accumulation
 
@@ -561,9 +563,9 @@ def main():
             avg_loss = running_loss / config.log_interval
             avg_grad_norm = np.mean(grad_norms) if grad_norms else 0
             lr = scheduler.get_last_lr()[0]
-            # Account for gradient accumulation in tokens/sec calculation
+            # FIXED: Use effective batch size for correct tokens/sec calculation
             effective_batch_size = config.batch_size * config.gradient_accumulation_steps
-            tokens_per_sec = (config.batch_size * config.sequence_length) / step_time
+            tokens_per_sec = (effective_batch_size * config.sequence_length) / step_time
 
             log_dict = {
                 "train/loss": avg_loss,
