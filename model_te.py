@@ -113,10 +113,10 @@ class GPT2TEModel(nn.Module):
                 amax_compute_algo="max"
             )
         elif cfg.recipe_type == "delayed_e4m3":
-            # E4M3 for both forward and backward (like test2.py)
+            # E4M3 for both forward and backward (matches test2.py and test_transformer_layer.py)
             self._fp8_recipe = DelayedScaling(
-                fp8_format=Format.E4M3,
-                margin=0
+                margin=0,
+                fp8_format=Format.E4M3
             )
         elif cfg.recipe_type == "mxfp8":
             # MXFP8 block scaling with E4M3
