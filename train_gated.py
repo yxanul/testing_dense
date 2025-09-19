@@ -46,8 +46,8 @@ class TrainingConfig:
     batch_size: int = 16  # Batch size 16
     sequence_length: int = 1024  # Block size 1024 (faster iterations)
     gradient_accumulation_steps: int = 16  # GA 16 for effective batch size of 256
-    learning_rate: float = 3e-4
-    min_learning_rate: float = 3e-5
+    learning_rate: float = 6e-4  # Increased for large effective batch size
+    min_learning_rate: float = 6e-5  # Scaled proportionally
     weight_decay: float = 0.1
     adam_beta1: float = 0.9
     adam_beta2: float = 0.95
@@ -55,7 +55,7 @@ class TrainingConfig:
     max_grad_norm: float = 1.0
 
     # Scheduler
-    warmup_steps: int = 1000
+    warmup_steps: int = 500  # Reduced for faster warmup with GA=16
     lr_scheduler: str = "cosine"  # "cosine" or "linear"
 
     # Training duration

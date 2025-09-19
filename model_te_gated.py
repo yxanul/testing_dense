@@ -22,7 +22,7 @@ from typing import Optional
 class GatedConfig:
     # Model architecture
     vocab_size: int = 32768  # Mistral tokenizer size
-    n_positions: int = 2048
+    n_positions: int = 2048  # Max positions (can use shorter sequences)
     n_embd: int = 768
     n_layer: int = 12
     n_head: int = 12
